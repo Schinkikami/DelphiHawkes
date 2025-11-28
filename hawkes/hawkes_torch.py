@@ -252,7 +252,7 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         
         super().__init__()
 
-        self.reg_lambda = reg_lambda
+        self.reg_lambda = reg_lambda # Unused for now
 
         generator = torch.Generator()
         if seed is not None:
@@ -267,7 +267,7 @@ class MultiVariateHawkesProcess(torch.nn.Module):
             self.mu = torch.nn.Parameter(inverse_softplus(torch.ones(size=(D,), dtype=torch.float32))*1e-8)
             self.log_alpha = torch.nn.Parameter(inverse_softplus(torch.rand(D,D,generator=generator)+1e-8))
             self.log_beta = torch.nn.Parameter(inverse_softplus(torch.rand(D,D,generator=generator)+1e-8))
-            self.ensure_stability()
+            self.ensure_stability(radius=0.5) # Limit spectral radius of alpha/beta matrix to be < 1.
             
         else:
             if D is None:
@@ -281,7 +281,7 @@ class MultiVariateHawkesProcess(torch.nn.Module):
             self.log_beta = torch.nn.Parameter(inverse_softplus(params.beta))
             stable, max_eig = self.check_stability()
             if not stable:
-                print(f"Warning: Provided parameters are unstable. Spectral radius: {max_eig}")
+                print(f"Warning: Provided parameters are unstable. Spectral radius: {max_eig} >= 1.")
         self.INTEGRATION_MODE = integration_mode
 
     def check_stability(self):
@@ -292,13 +292,15 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         spectral_radius = torch.max(torch.abs(eigenvalues)).item()
         return spectral_radius < 1, spectral_radius
 
-    def ensure_stability(self):
+    def ensure_stability(self, radius:float= 1.0):
         # Compute the spectral radius
         _, max_eig = self.check_stability()
         if max_eig >= 1.0:
             print(f"Rescaling alpha to ensure stability. Current spectral radius: {max_eig}")
-            current_alphas = self.transform_params()[1]
-            self.log_alpha.data = inverse_softplus(current_alphas / (max_eig+1e-7))
+            _, alpha, beta = self.transform_params()
+            self.log_alpha.data = inverse_softplus(alpha / np.sqrt(((1/radius) * max_eig)+1e-7))
+            self.log_beta.data = inverse_softplus(beta * np.sqrt(((1/radius)*max_eig)+1e-7))
+
             print(f"New spectral radius: {self.check_stability()[1]}")
         
     def transform_params(self):
@@ -363,6 +365,58 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         intensity = mu + torch.sum(contributions, dim=0)
         return intensity # Shape: (D,)
 
+    def _positive_likelihood_vetorized(
+        self,
+        ts: MVEventData,
+        log: bool = True,
+    ):
+        # Uses a lower triangular matrix to compute all intensities at once
+        
+        num_events = len(ts)
+
+        #TODO move triling to the end, to make interaction with exp correct
+
+        # Computes the time-difference matrix T.
+        # $T_{i,j} = t_i - t_j$ if $i > j$ else 0
+        time_diffs = ts.time_points.unsqueeze(1) - ts.time_points.unsqueeze(0) # Shape: (num_events, num_events)
+        time_diffs = torch.tril(time_diffs, diagonal=-1)  # Zero out diagonal and above.
+
+
+        # Get receiver (j) types: (N) -> (N, 1)
+        receiver_types = ts.event_types.unsqueeze(-1)
+        
+        # Get trigger (i) types: (N) -> (1, N)
+        trigger_types = ts.event_types.unsqueeze(0)
+
+        mu, alpha, beta = self.transform_params()
+
+        # Create a matrix of shape (N, N) where each entry (i,j) corresponds to alpha_{receiver_types[i], trigger_types[j]}
+        alpha_matrix = alpha[receiver_types, trigger_types] # Shape: (N, N)
+        beta_matrix = beta[receiver_types, trigger_types] # Shape: (N, N)
+
+        # Compute the kernel values for all time differences
+        interaction_terms = alpha_matrix * beta_matrix * torch.exp(-beta_matrix * time_diffs) # Shape: (N, N)
+
+        # We now want the impact of past events on the current event.
+        # For this we sum the rows. To get the intensities we also add the correct mu values.
+        intensities = mu[ts.event_types] + torch.sum(interaction_terms, dim=1) # Shape: (N,)
+
+        if log:
+            positive_likelihood = torch.sum(input=torch.log(intensities)) # Shape: ()
+        else:
+            positive_likelihood = torch.prod(intensities) # Shape: ()
+
+        return positive_likelihood
+    
+    def _negative_likelihood_vectorized(
+        self,
+        ts: MVEventData,
+        T: float,
+        log: bool = True,
+        num_integration_points: int = 1000,
+        analy_kernel: bool = True,
+    ):
+
     def likelihood(
         self,
         ts: MVEventData,
@@ -391,7 +445,14 @@ class MultiVariateHawkesProcess(torch.nn.Module):
 
         num_events = len(ts)
         
+        if vectorized and analy_kernel:
+            return self._likelihood_vectorized( ts, T, log, num_integration_points, analy_kernel)
+
+        # Positive likelihood
+        #----
+        
         if num_events == 0:
+            #TODO this prob. wrong. Positive likelihood should be zero? But then what about the LL?
             # We received an empty event list
             intensities = torch.stack([self.intensity( T, ts)]) # Shape: (1, D)
         else:
@@ -401,13 +462,16 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         # Only use the occured events.
         occured_intensities = intensities[torch.arange(num_events), ts.event_types] # Shape: (num_events,)
         if log:
-            
             positive_likelihood = torch.sum(input=torch.log(occured_intensities)) # Shape: ()
         else:
 
             positive_likelihood = torch.prod(occured_intensities) # Shape: ()
         
-        #TODO is everything correct with the log case?
+        #----
+        # Negative likelihood
+        #----
+        #I think everything is correct for the log case...
+
         if num_integration_points == 0 and analy_kernel:
             # For the exponential kernel, we can compute the integral analytically
             integral = self.integral_exp_kernel( T, ts)
@@ -474,7 +538,7 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         else:
             raise ValueError(f"Unknown INTEGRATION_MODE {self.INTEGRATION_MODE}")
 
-    def sample(self, Tstart:float, Tend:float, ts:Optional[MVEventData]=None):
+    def sample(self, Tstart:float, Tend:float, ts:Optional[MVEventData]=None, max_samples:Optional[float]=None):
         """Generate a sample from the Hawkes process using Ogata's thinning algorithm.
         
         Args:
@@ -485,6 +549,8 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         """
 
         #TODO include seeding
+
+        num_samples = 0
 
         if ts is None:
             events = []
@@ -499,14 +565,14 @@ class MultiVariateHawkesProcess(torch.nn.Module):
         t = Tstart
 
         while t < Tend:
-            lambdas = self.intensity(t, MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types)))
+            lambdas = self.intensity(t, MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)))
             lambda_sum = lambdas.sum().item() + 1e-8  # total intensity
             delta_t = torch.distributions.Exponential(lambda_sum).sample().item()
             t_proposed = t + delta_t
             if t_proposed > Tend:
                 break
             # Get intensity at proposed time
-            lambdas_prop = self.intensity(t_proposed, MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types)))
+            lambdas_prop = self.intensity(t_proposed, MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)))
             lambda_sum_prop = lambdas_prop.sum().item()
             if torch.rand(1) <= lambda_sum_prop / lambda_sum:
                 # Accept
@@ -514,5 +580,9 @@ class MultiVariateHawkesProcess(torch.nn.Module):
                 event_type = torch.multinomial(probs, 1).item()
                 events.append(t_proposed)
                 event_types.append(event_type)
+                num_samples += 1
+                if max_samples is not None and num_samples >= max_samples:
+                    break
             t = t_proposed
-        return MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types))
+        return MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long))
+    
