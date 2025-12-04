@@ -1,20 +1,21 @@
-#%%
+# %%
 from tensordict import TensorDict
 from torch import Tensor
 import torch
 
 
-def inverse_softplus(x:Tensor):
+def inverse_softplus(x: Tensor):
     # Computes the inverse of the softplus function,
     # using the numerically stable log(expm1(x)) implementation
     # (sadly torch does not provide logexpm1)
     return torch.log(torch.expm1(x))
 
-#%%
+
+# %%
+
 
 class MVEventData(TensorDict):
-    def __init__(self, time_points:Tensor, event_types:Tensor, sort:bool=False):
-
+    def __init__(self, time_points: Tensor, event_types: Tensor, sort: bool = False):
         assert time_points.dim() == 1
         assert event_types.dim() == 1
         assert time_points.shape == event_types.shape
@@ -29,21 +30,15 @@ class MVEventData(TensorDict):
             time_points = time_points[sorted_indices]
             event_types = event_types[sorted_indices]
 
-
-        super().__init__({
-            'time_points': time_points,
-            'event_types': event_types
-        }, batch_size=len(time_points))
-
-
+        super().__init__({"time_points": time_points, "event_types": event_types}, batch_size=len(time_points))
 
     @property
     def time_points(self):
-        return self['time_points']
+        return self["time_points"]
 
     @property
     def event_types(self):
-        return self['event_types']
+        return self["event_types"]
 
     def __getitem__(self, idx):
         # If idx is an int/scalar, yield tuple of Python scalars
@@ -75,7 +70,11 @@ class MVEventData(TensorDict):
             length = 0
         tps = abbrev(self.time_points)
         ets = abbrev(self.event_types)
-        return (f"MVEventData(len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
-                f"  time_points: {tps}\n"
-                f"  event_types: {ets}")
+        return (
+            f"MVEventData(len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
+            f"  time_points: {tps}\n"
+            f"  event_types: {ets}"
+        )
 
+
+# %%

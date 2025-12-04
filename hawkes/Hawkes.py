@@ -1,335 +1,654 @@
-"""
-Basic implementation that is pulled from https://github.com/stmorse/hawkes?tab=readme-ov-file
+# My own implementation of the Hawkes process
+# %%
+from dataclasses import dataclass
+from typing import Literal, Optional
+import torch
+import torch.nn.functional as F
+from einops import rearrange
 
-Author: Steven Morse
-Email: steventmorse@gmail.com
-License: MIT License (see LICENSE in top folder)
+from event_utils import MVEventData, inverse_softplus
 
-Implementation of MAP EM algorithm for Hawkes process as described in:
-https://arxiv.org/abs/2005.06542
-https://stmorse.github.io/docs/orc-thesis.pdf
+# %%
 
-@article{xu2020modeling,
-  title={Modeling human dynamics and lifestyle using digital traces},
-  author={Xu, Sharon and Morse, Steven and Gonz{\'a}lez, Marta C},
-  journal={arXiv preprint arXiv:2005.06542},
-  year={2020}
-}
 
-NOTE: This is an update of the previous repo, improving several matrix
-manipulations in the train method and adding more commenting.
-"""
+@dataclass
+class ExpKernelParams:
+    """
+    Parameters for a Hawkes Process with Exponential Kernel.
+    Shapes have to be consisttent: (D,), (D,D) and (D,D).
+    For alpha and beta the first dimension is the receiving event type, the second the triggering event type.
+    --> alpha[i,j] scales the impact of an event of type j on the intensity of events of type i.
+    """
 
-import time as T
+    mu: torch.Tensor
+    alpha: torch.Tensor
+    beta: torch.Tensor
 
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.metrics.pairwise import pairwise_distances
 
-class MHP:
-    def __init__(self, alpha=[[0.5]], mu=[0.1], omega=1.0):
-        self.alpha = np.array(alpha)
-        self.mu = np.array(mu)
-        self.omega = float(omega)
-        self.dim = self.mu.shape[0]
+class AbstractHawkesProcess(torch.nn.Module):
+    def __init__(
+        self,
+        D: Optional[int] = None,
+        seed: Optional[int] = 42,
+        integration_mode: Literal["trapezoidal", "monte_carlo", "mc_trapezoidal"] = "trapezoidal",
+    ) -> None:
+        self.D = D
+        self.seed = seed
+        self.integration_mode = integration_mode
+
+        super().__init__()
+
+    def kernel(self, delta_t: float, type_1: int, type_2: int):
+        raise NotImplementedError()
+
+    def intensity(self, t: float | torch.Tensor, ts: MVEventData | list[MVEventData]):
+        raise NotImplementedError("Overwrite this function to implement a kernel.")
+
+    def intensity_integral(self, T: float | torch.Tensor, ts: MVEventData | list[MVEventData]):
+        raise NotImplementedError("Optional.")
+
+    def get_parameters(self):
+        raise NotImplementedError("Implement: Return the true parameters of the kernel.")
+
+    def _enocde_parameters(self):
+        raise NotImplementedError()
+
+    def likelihood(self, T: float, ts: MVEventData | list[MVEventData], log: bool = True):
+        raise NotImplementedError()
+
+    def sample(self, T, ts: MVEventData):
+        raise NotImplementedError()
+
+    def integral_numerical(self, T: float, ts: MVEventData, num_integration_points: int = 1000):
+        # Currently not used as we use the exponential kernel.
+        # However, good for comparing performance for later kernels.
+
+        if self.INTEGRATION_MODE == "trapezoidal":
+            evaluation_points = torch.linspace(0, T, num_integration_points)
+
+            ## Find the indices of events to include at each evaluation point
+            ## Vectorized PyTorch implementation
+            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
+            ## Old loop-based implementation
+            # included_events_idcs = torch.zeros_like(evaluation_points, dtype=torch.long)
+            # curr_idx = 0
+            # for i,t in enumerate(evaluation_points):
+            #    #Only include events before time t
+            #    while curr_idx < len(ts) and ts.time_points[curr_idx] < t:
+            #        curr_idx += 1
+            #    included_events_idcs[i] = curr_idx
+
+            ## Compute intensity values at each evaluation point
+            ## Fast implementation.
+            intensity_values = torch.stack(
+                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
+            )  # Shape: (num_integration_points, D)
+            integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
+
+            ## Old loop-based implementation
+            # for i, t in enumerate(evaluation_points):
+            #    #Only include events before time t
+            #    while included_events_idx < len(ts) and ts.time_points[included_events_idx] < t:
+            #        included_events_idx += 1
+            #    relevant_events = ts[:included_events_idx]
+            #    intensity_values[i] = self.intensity( t, relevant_events)
+            # integral = _trapz(intensity_values, evaluation_points)
+
+            return integral
+
+        elif self.INTEGRATION_MODE == "monte_carlo":
+            # Monte-Carlo integration
+            # Should not be used (high variance and unoptimized implementation)
+            # Raise warning on first use that it is not recommended.
+            if not hasattr(self, "_mc_warning_issued"):
+                print(
+                    "Warning: Monte Carlo integration mode is not recommended due to high variance and unoptimized implementation."
+                )
+                self._mc_warning_issued = True
+
+            rng = torch.Generator()
+
+            evaluation_points = T * torch.rand(size=(num_integration_points,), generator=rng)
+            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
+            intensity_values = torch.stack(
+                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
+            )  # Shape: (num_integration_points, D)
+
+            integral = (T / num_integration_points) * torch.sum(intensity_values)
+
+            return integral
+
+        elif self.INTEGRATION_MODE == "mc_trapezoidal":
+            # Hybrid Monte-Carlo + Trapezoidal integration
+            # Trapezoidal integration on random evaluation points. Beginning and end points are always included.
+
+            rng = torch.Generator()
+
+            evaluation_points = T * torch.rand(size=(num_integration_points - 2,), generator=rng)
+            evaluation_points = torch.cat([torch.tensor([0.0]), evaluation_points, torch.tensor([T])])
+            evaluation_points, _ = torch.sort(evaluation_points)
+
+            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
+            intensity_values = torch.stack(
+                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
+            )  # Shape: (num_integration_points, D)
+
+            integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
+
+            return integral
+
+        else:
+            raise ValueError(f"Unknown INTEGRATION_MODE {self.INTEGRATION_MODE}")
+
+
+class ExpKernelMVHawkesProcess(torch.nn.Module):
+    def __init__(
+        self,
+        params: Optional[ExpKernelParams],
+        D: Optional[int] = None,
+        seed: Optional[int] = 42,
+        integration_mode: Literal["trapezoidal", "monte_carlo", "mc_trapezoidal"] = "trapezoidal",
+    ):
+        """Initialize the MultivariateHawkes process.
+
+        Args:
+            params: Hawkes process parameters or None to initialize randomly
+            D: Event dimension (required if params is None)
+            seed: random seed for initialization
+            reg_lambda: regularization parameter
+            integration_mode: How to estimate the intensity integral in the likelihood computation
+        """
+
+        super().__init__()
+
+        generator = torch.Generator()
+        if seed is not None:
+            generator = generator.manual_seed(seed)
+
+        self.generator = generator
+
+        if params is None and D is None:
+            raise ValueError("Either params or D (number of dimensions) must be provided.")
+
+        if params is None:
+            self.mu = torch.nn.Parameter(inverse_softplus(torch.ones(size=(D,), dtype=torch.float32)) * 1e-8)
+            self.log_alpha = torch.nn.Parameter(inverse_softplus(x=torch.rand(D, D, generator=generator) + 1e-8))
+            self.log_beta = torch.nn.Parameter(inverse_softplus(torch.rand(D, D, generator=generator) + 1e-8))
+            self.ensure_stability(radius=1.0)  # Limit spectral radius of alpha/beta matrix to be < 1.
+
+        else:
+            if D is None:
+                D = params.mu.shape[0]
+
+            assert params.mu.shape[0] == D, "Dimension mismatch in mu"
+            assert params.alpha.shape == (D, D), "Dimension mismatch in alpha"
+            assert params.beta.shape == (D, D), "Dimension mismatch in beta"
+            self.mu = torch.nn.Parameter(inverse_softplus(params.mu))
+            self.log_alpha = torch.nn.Parameter(inverse_softplus(params.alpha))
+            self.log_beta = torch.nn.Parameter(inverse_softplus(params.beta))
+            stable, max_eig = self.check_stability()
+            if not stable:
+                print(f"Warning: Provided parameters are unstable. Spectral radius: {max_eig} >= 1.")
+        self.INTEGRATION_MODE = integration_mode
 
     def check_stability(self):
-        '''Check stability of process (max alpha eigenvalue < 1)'''
-        w, _ = np.linalg.eig(self.alpha)
-        me = np.amax(np.abs(w.real))
-        print(f'Max eigenvalue: {me:1.5f}')
-        if me >= 1.:
-            print('(WARNING) Unstable.')
-        else:
-            print('Appears stable')
+        # Check if the Hawkes process is stable (spectral radius of alpha/beta < 1)
+        _, alpha, beta = self.transform_params()
+        kernel_matrix = alpha / beta  # Shape: (D,D)
+        eigenvalues = torch.linalg.eigvals(kernel_matrix)
+        spectral_radius = torch.max(torch.abs(eigenvalues)).item()
+        return spectral_radius < 1, spectral_radius
 
-    def get_rate(self, data, ct, d):
-        """Return rate at time ct in dimension d"""
-        seq = np.array(data)
-        if not np.all(ct > seq[:,0]): 
-            seq = seq[seq[:,0] < ct]
-        return (
-            self.mu[d] + np.sum([
-                self.alpha[d,int(j)] * self.omega * np.exp(-self.omega*(ct-t)) 
-                for t,j in seq
-            ])
+    def ensure_stability(self, radius: float = 1.0):
+        # Compute the spectral radius
+        _, max_eig = self.check_stability()
+        if max_eig >= 1.0:
+            # print(f"Rescaling alpha to ensure stability. Current spectral radius: {max_eig}")
+            _, alpha, beta = self.transform_params()
+            self.log_alpha.data = inverse_softplus(alpha / ((1 / radius) * max_eig) + 1e-7)
+
+            # self.log_alpha.data = inverse_softplus(alpha / ((1/radius) * max_eig)+1e-7)
+            # self.log_beta.data = inverse_softplus(beta * np.sqrt(((1/radius)*max_eig)+1e-7))
+
+            # print(f"New spectral radius: {self.check_stability()[1]}")
+
+    def transform_params(self, mu=True, alpha=True, beta=True):
+        # Constrain parameters alpha and beta and mu to be positive
+
+        parameters = []
+
+        if mu:
+            parameters += [F.softplus(self.mu)]
+        if alpha:
+            parameters += [F.softplus(self.log_alpha)]
+        if beta:
+            parameters += [F.softplus(self.log_beta)]
+
+        return tuple(parameters)
+
+    def integral_exp_kernel(self, T, ts: BatchedMVEventData):
+        mu, alpha, beta = self.transform_params()
+
+        valid_mask = ts.event_types != -1
+        integral = (mu * T).unsqueeze(-1)  # Shape: (D,1)
+
+        if len(ts) > 0:
+            # Vectorized multivariate implementation
+            delta_t = (T - ts.time_points).unsqueeze(0)  # Shape: (1,B,N)
+            relevant_alpha = alpha[:, ts.event_types]  # Shape: (D,B,N)
+            relevant_beta = beta[:, ts.event_types]  # Shape: (D,B,N)
+            contributions = relevant_alpha * (1 - torch.exp(-relevant_beta * delta_t))  # Shape: (D,B,N)
+            contributions = contributions.permute(1, 2, 0)  # Shape (B,N,D)
+            contributions.masked_fill(~valid_mask.unsqueeze(-1), 0)  # Set non valid numbers to zero. Use broadcasting.
+            contributions = contributions.permute(2, 0, 1)  # Shape: (D,B,N)
+            integral += torch.sum(contributions, dim=2)  # Shape: (D,B)
+        integral = integral.T
+        return integral
+
+    def positive_likelihood(
+        self,
+        ts: MVEventData,
+        log: bool = True,
+    ):
+        # Uses a lower triangular matrix to compute all intensities at once
+
+        # Shape ts: [batch_size, len]
+        # ts arrays are right padded. np.inf for time and -1 for type
+
+        # Computes the time-difference matrix T.
+        # $T_{b,i,j} = t_b,i - t_b,j$ if $i > j$ else 0
+
+        time_diffs = rearrange(ts.time_points, "b l -> b l 1") - rearrange(
+            ts.time_points, "b l -> b 1 l"
+        )  # Shape B N N
+
+        # Get receiver (j) types: (B, N) -> (B, N, 1)
+        receiver_types = rearrange(ts.event_types, "b l -> b l 1")
+
+        # Get trigger (i) types: (B, N) -> (B, 1, N)
+        trigger_types = rearrange(ts.event_types, "b l -> b 1 l")
+
+        mu, alpha, beta = self.transform_params()
+
+        # Create a matrix of shape (B, N, N) where each entry (b, i,j) corresponds to alpha_{receiver_types[b,i], trigger_types[b,j]}
+        alpha_matrix = alpha[receiver_types, trigger_types]  # Shape: (B, N, N)
+        beta_matrix = beta[receiver_types, trigger_types]  # Shape: (B, N, N)
+
+        # Compute the kernel values for all time differences
+        interaction_terms = alpha_matrix * beta_matrix * torch.exp(-beta_matrix * time_diffs)  # Shape: (B,N, N)
+        interaction_terms = torch.tril(
+            interaction_terms, diagonal=-1
+        )  # Zero out diagonal and above, to ensure causality. This works also with batched matrices.
+
+        # Mask out invalid events.
+        valid_events = ts.event_types != -1
+        valid_event_mask = rearrange(valid_events, "B N -> B N 1") & rearrange(valid_events, "B N -> B 1 N")
+        # TODO Make sure multiplication works here. Maybe we need indexing.
+        interaction_terms *= valid_event_mask
+
+        relevant_mu = mu[ts.event_types] * valid_events  # Shape (B,N)
+
+        # We now want the impact of past events on the current event.
+        # For this we sum the rows. To get the intensities we also add the correct mu values.
+        intensities = relevant_mu + torch.sum(interaction_terms, dim=2)  # Shape: (B,N,)
+
+        # TODO make sure it works with empty event sequences for some batch elements.
+        if log:
+            positive_likelihood = torch.sum(input=torch.log(intensities), dim=-1)  # Shape: (B,)
+        else:
+            positive_likelihood = torch.prod(intensities, dim=-1)  # Shape: (B,)
+
+        return positive_likelihood
+
+    def likelihood(
+        self,
+        ts: MVEventData,
+        T: float,
+        log: bool = True,
+    ):
+        """
+        Compute the likelihood of observed event times under the Hawkes process model.
+
+        Args:
+            params: Hawkes process parameters (Params NamedTuple).
+            ts: Array of event times.
+            T: End time for the observation window (defaults to last event).
+            num_integration_points: Number of points for numerical integration (trapezoidal rule).
+
+        Returns:
+            The likelihood value (float) for the observed events.
+
+        Mathematical context:
+            Likelihood = product of intensities at event times
+                        minus the integral of the intensity over [0, T].
+        """
+
+        num_integration_points = 0
+
+        # TODO throw error when T <= last event time
+        num_events = (ts.event_types != -1).sum(dim=1)
+
+        # Positive likelihood
+        # ----
+        # Efficient vectorized implementation.
+        positive_likelihood = self.positive_likelihood(ts, log)
+
+        # Mask out event sequences with no elements. They only contribute negativly.
+        num_0 = num_events == 0
+        positive_likelihood[num_0] = torch.tensor(0.0) if log else torch.tensor(1.0)
+
+        # ----
+        # Negative likelihood
+        # ----
+
+        if num_integration_points == 0:
+            # For the exponential kernel, we can compute the integral analytically.
+            integral = self.integral_exp_kernel(T, ts)
+        else:
+            # Rely on numerical integration.
+            integral = self._integral_numerical(T, ts, num_integration_points)
+
+        if log:
+            negative_likelihood = torch.sum(-integral, dim=1)  # Shape: (B,)
+        else:
+            negative_likelihood = torch.prod(torch.exp(-integral), dim=1)  # Shape: (B,)
+
+        # ----
+        # Return total likelihood
+
+        if log:
+            return positive_likelihood + negative_likelihood
+        else:
+            return positive_likelihood * negative_likelihood
+
+    def _integral_numerical(self, T: float, ts: MVEventData, num_integration_points: int = 1000):
+        # Currently not used as we use the exponential kernel.
+        # However, good for comparing performance for later kernels.
+
+        if self.INTEGRATION_MODE == "trapezoidal":
+            evaluation_points = torch.linspace(0, T, num_integration_points)
+
+            ## Find the indices of events to include at each evaluation point
+            ## Vectorized PyTorch implementation
+            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
+            ## Old loop-based implementation
+            # included_events_idcs = torch.zeros_like(evaluation_points, dtype=torch.long)
+            # curr_idx = 0
+            # for i,t in enumerate(evaluation_points):
+            #    #Only include events before time t
+            #    while curr_idx < len(ts) and ts.time_points[curr_idx] < t:
+            #        curr_idx += 1
+            #    included_events_idcs[i] = curr_idx
+
+            ## Compute intensity values at each evaluation point
+            ## Fast implementation.
+            intensity_values = torch.stack(
+                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
+            )  # Shape: (num_integration_points, D)
+            integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
+
+            ## Old loop-based implementation
+            # for i, t in enumerate(evaluation_points):
+            #    #Only include events before time t
+            #    while included_events_idx < len(ts) and ts.time_points[included_events_idx] < t:
+            #        included_events_idx += 1
+            #    relevant_events = ts[:included_events_idx]
+            #    intensity_values[i] = self.intensity( t, relevant_events)
+            # integral = _trapz(intensity_values, evaluation_points)
+
+            return integral
+
+        elif self.INTEGRATION_MODE == "monte_carlo":
+            # Monte-Carlo integration
+            # Should not be used (high variance and unoptimized implementation)
+            # Raise warning on first use that it is not recommended.
+            if not hasattr(self, "_mc_warning_issued"):
+                print(
+                    "Warning: Monte Carlo integration mode is not recommended due to high variance and unoptimized implementation."
+                )
+                self._mc_warning_issued = True
+
+            rng = torch.Generator()
+
+            evaluation_points = T * torch.rand(size=(num_integration_points,), generator=rng)
+            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
+            intensity_values = torch.stack(
+                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
+            )  # Shape: (num_integration_points, D)
+
+            integral = (T / num_integration_points) * torch.sum(intensity_values)
+
+            return integral
+
+        elif self.INTEGRATION_MODE == "mc_trapezoidal":
+            # Hybrid Monte-Carlo + Trapezoidal integration
+            # Trapezoidal integration on random evaluation points. Beginning and end points are always included.
+
+            rng = torch.Generator()
+
+            evaluation_points = T * torch.rand(size=(num_integration_points - 2,), generator=rng)
+            evaluation_points = torch.cat([torch.tensor([0.0]), evaluation_points, torch.tensor([T])])
+            evaluation_points, _ = torch.sort(evaluation_points)
+
+            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
+            intensity_values = torch.stack(
+                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
+            )  # Shape: (num_integration_points, D)
+
+            integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
+
+            return integral
+
+        else:
+            raise ValueError(f"Unknown INTEGRATION_MODE {self.INTEGRATION_MODE}")
+
+    def sample(self, Tstart: float, Tend: float, ts: Optional[MVEventData] = None, max_samples: Optional[float] = None):
+        """Generate a sample from the Hawkes process using Ogata's thinning algorithm.
+
+        Args:
+            Tstart: Start time
+            Tend: End time
+            events: Initial events (optional)
+            seed: Random seed
+        """
+
+        # TODO include seeding for reproducibility.
+
+        # Required if the process is potentially unstable (infinite loop)
+        num_samples = 0
+
+        if ts is None:
+            events = []
+            event_types = []
+        else:
+            # unpack times and types
+            events = ts.time_points.tolist()
+            event_types = ts.event_types.tolist()
+
+        # Generators do not work with torch distributions...
+        # generator = torch.Generator()
+
+        t = Tstart
+
+        while t < Tend:
+            lambdas = self.intensity(
+                t,
+                MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)),
+            )
+            lambda_sum = lambdas.sum().item() + 1e-8  # total intensity
+            delta_t = torch.distributions.Exponential(lambda_sum).sample().item()
+            t_proposed = t + delta_t
+            if t_proposed > Tend:
+                break
+            # Get intensity at proposed time
+            lambdas_prop = self.intensity(
+                t_proposed,
+                MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)),
+            )
+            lambda_sum_prop = lambdas_prop.sum().item()
+            if torch.rand(1) <= lambda_sum_prop / lambda_sum:
+                # Accept
+                probs = lambdas_prop / lambda_sum_prop
+                event_type = torch.multinomial(probs, 1).item()
+                events.append(t_proposed)
+                event_types.append(event_type)
+                num_samples += 1
+                if max_samples is not None and num_samples >= max_samples:
+                    break
+            t = t_proposed
+        return MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long))
+
+    def sample_naive(self, Tstart: float, Tend: float, step_size: float, ts: Optional[MVEventData] = None):
+        """Generate a sample from the Hawkes process using a very naive stepping algorithm.
+
+        Args:
+            Tstart: Start time
+            Tend: End time
+            delta_t: Time step
+            events: Initial events (optional)
+            seed: Random seed
+        """
+
+        if ts is None:
+            events = []
+            event_types = []
+        else:
+            # unpack times and types
+            events = ts.time_points.tolist()
+            event_types = ts.event_types.tolist()
+
+        t = Tstart
+
+        while t < Tend:
+            lambdas = self.intensity(
+                t,
+                MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)),
+            )
+            # We approximate the intensities as locally constant. Then we can treat them all as if they were
+            # exponentially distributed in a very small time window [t,t+delta_t]
+
+            # We sample all exponentials at the same time, through batching.
+            samples = torch.distributions.Exponential(lambdas).sample((1,))[0]
+
+            # These samples are only "valid" for a very small time-windows (as the intensities are not constant but decreasing).
+            accepted_samples = samples <= step_size
+            accepted_event_types = torch.arange(len(lambdas))[accepted_samples]
+            accepted_event_times = t + samples[accepted_samples]
+
+            sort_idcs = torch.argsort(accepted_event_times)
+
+            accepted_event_times = accepted_event_times[sort_idcs]
+            accepted_event_types = accepted_event_types[sort_idcs]
+
+            for t, e in zip(accepted_event_times, accepted_event_types):
+                events.append(t.item())
+                event_types.append(e.item())
+
+        return MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long))
+
+
+# %%
+
+from event_utils import MVEventData
+from torch import Tensor
+from tensordict import TensorDict
+
+
+class BatchedMVEventData(TensorDict):
+    def __init__(self, time_points: list[Tensor], event_types: list[Tensor], sort: bool = False):
+        assert isinstance(time_points, list)
+        assert isinstance(event_types, list)
+        assert len(time_points) == len(event_types)
+
+        batch_size = len(time_points)
+
+        for t, e in zip(time_points, event_types):
+            assert t.dim() == 1
+            assert e.dim() == 1
+            assert t.shape == e.shape
+
+        # Assert time_points have float type
+        assert time_points[0].dtype.is_floating_point
+        # Assert event_types have integer type
+        assert not event_types[1].dtype.is_floating_point
+
+        if sort:
+            for i in range(len(time_points)):
+                sorted_indices = torch.argsort(time_points[i])
+                time_points[i] = time_points[i][sorted_indices]
+                event_types[i] = event_types[i][sorted_indices]
+
+        lengths = [len(b) for b in time_points]
+        length = max(lengths)
+        device = time_points[0].device
+        dtype_time = time_points[0].dtype
+        dtype_event = event_types[0].dtype
+
+        padded_time_points = torch.full((batch_size, length), float("inf"), dtype=dtype_time, device=device)
+        padded_event_types = torch.full((batch_size, length), -1, dtype=dtype_event, device=device)
+
+        for i, (t, e) in enumerate(zip(time_points, event_types)):
+            n = len(t)
+            padded_time_points[i, :n] = t
+            padded_event_types[i, :n] = e
+
+        super().__init__(
+            {"time_points": padded_time_points, "event_types": padded_event_types}, batch_size=(batch_size, length)
         )
 
-    def generate(self, horizon=10, data=None):
-        '''Generate a sequence based on mu, alpha, omega values. 
-        Uses Ogata's thinning method, with some speedups, noted below'''
+    @property
+    def time_points(self):
+        return self["time_points"]
 
-        data = np.array([[0,0]]) if data is None else np.array(data)
+    @property
+    def event_types(self):
+        return self["event_types"]
 
-        # total base rate and initial event time s
-        Istar = np.sum(self.mu)
-        s = np.random.exponential(scale=1./Istar)
+    def __iter__(self):
+        # Iteration yields a tuple for each event
+        for i in range(len(self)):
+            yield self.time_points[i], self.event_types[i]
 
-        # attribute (weighted random sample, since sum(mu)==Istar)
-        n0 = np.random.choice(np.arange(self.dim), 
-                              1, 
-                              p=(self.mu / Istar))[0]
-        data = np.append(data, [[s, n0]], axis=0)
+    # def __repr__(self):
 
-        # value of \lambda(t_k) where k is most recent event
-        # starts with just the base rate
-        lastrates = self.mu.copy()
+    #     def abbrev(tensor, max_len=8, float_fmt="{:.2f}"):
+    #         l = tensor.tolist()
+    #         if tensor.dtype.is_floating_point:
+    #             l = [float_fmt.format(v) for v in l]
+    #         else:
+    #             l = [str(v) for v in l]
+    #         if len(l) > max_len:
+    #             return "[" + ", ".join(l[:4]) + ", ..., " + ", ".join(l[-3:]) + "]"
+    #         return "[" + ", ".join(l) + "]"
 
-        decIstar = False
-        while True:
-            # get the last event time and attribution
-            tj, uj = data[-1,0], int(data[-1,1])
+    #     batch_size = self.time_points.shape[0]
+    #     length = self.time_points.shape[1]
 
-            if decIstar:
-                # if last event was rejected, decrease Istar
-                Istar = np.sum(rates)
-                decIstar = False
-            else:
-                # otherwise, we just had an event, so recalc Istar 
-                # (inclusive of last event)
-                Istar = np.sum(lastrates) + \
-                        self.omega * np.sum(self.alpha[:,uj])
+    #     if batch_size == 0:
+    #         return (
+    #             f"BatchedMVEventData(batch=0, len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
+    #             f"  time_points: {tps}\n"
+    #             f"  event_types: {ets}"
+    #         )
 
-            # generate new event
-            s += np.random.exponential(scale=1./Istar)
+    #     if batch_size in [0, 1]:
+    #         tps = abbrev(self.time_points)
+    #         ets = abbrev(self.event_types)
+    #     return (
+    #         f"BatchedMVEventData(len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
+    #         f"  time_points: {tps}\n"
+    #         f"  event_types: {ets}"
+    #     )
 
-            # calc rates at time s 
-            # (use trick to take advantage of rates at last event, 
-            # see thesis or paper linked at top of file)
-            rates = (
-                self.mu + np.exp(-self.omega * (s - tj)) * 
-                (self.alpha[:,uj].flatten() * self.omega + lastrates - self.mu)
-            )
 
-            # attribution/rejection test
-            # handle attribution and thinning in one step as weighted random sample
-            diff = Istar - np.sum(rates)
-            n0 = np.random.choice(
-                np.arange(self.dim+1), 
-                1, 
-                p=(np.append(rates, diff) / Istar)
-            )[0]
-            
-            if n0 < self.dim:
-                data = np.append(data, [[s, n0]], axis=0)
-                # update lastrates
-                lastrates = rates.copy()
-            else:
-                decIstar = True
+# %%
 
-            # if past horizon, done
-            if s >= horizon:
-                return data
-            
-    def train(self, seq, 
-              Ahat=None, mhat=None, omega=None, 
-              smx=None, tmx=None, regularize=False, 
-              Tm=-1, maxiter=100, epsilon=0.01, stopping_criterion='iterations',
-              verbose=True
-    ):
-        '''
-        Implements MAP EM (from https://stmorse.github.io/docs/orc-thesis.pdf). 
-        
-        Optionally regularize with `smx` and `tmx` matrix (shape=(dim,dim)).
-        In general, the `tmx` matrix is a pseudocount of parent events from column j,
-        and the `smx` matrix is a pseudocount of child events from column j -> i.
-        
-        Parameters
-        ----------
-        seq : array-like (N, 2)
-            Sequence of events, where each row is (time, event_id).
-        Ahat : array-like, optional (dim, dim)
-            Estimate of triggering kernel.  If not specified, will use the value from initialization.
-        mhat : array-like, optional (dim,)
-            Estimate of background rates.  If not specified, will use the value from initialization.
-        omega : float, optional
-            Fixed omega (not learned).  If not specified, will use the value from initialization.
-        smx : array-like, optional (dim, dim)
-            Regularization matrix for child events.  Must be specified if `regularize` is True.
-        tmx : array-like, optional (dim, dim)
-            Regularization matrix for parent events.  Must be specified if `regularize` is True.
-        regularize : bool, optional
-            Whether to use regularization.  Default is False.
-        Tm : float, optional
-            Maximum time horizon of sequence.  If not specified, will use the last time stamp.
-            This only affects the log-likelihood for convergence testing, and is not critical.
-        maxiter : int, optional
-            Maximum number of iterations.  Default is 100.
-        epsilon : float, optional
-            Convergence threshold.  Default is 0.01.
-        stopping_criterion : str, optional
-            Convergence criterion.  Default is 'iterations'. 
-            Options are 'iterations' (requires maxiter) or 'll' (requires epsilon)
-        verbose : bool, optional
-            Whether to print progress.  Default is True.
-        return_p : bool, optional
-            Whether to return the p_ii and p_ij matrices.  Default is False.
+t = [torch.tensor([0.0, 0.2, 0.7]), torch.tensor([0.6, 0.7]), torch.tensor([])]
+e = [torch.tensor([0, 1, 0]), torch.tensor([1, 1]), torch.tensor([])]
 
-        Returns
-        -------
-        array-like (dim, dim)
-            Post-training estimate of triggering kernel.
-        array-like (dim,)
-            Post-training estimate of background rates.
-        array-like (N,)
-            Post-training estimate of p_ii.
-        array-like (N, N)
-            Post-training estimate of p_ij.
-        '''
-
-        # check that if regularize=True, smx and tmx are specified
-        # if not, turn off regularization and warn
-        if regularize and (smx is None or tmx is None):
-            print('Regularize is on but priors are not set. Turning off regularization.')
-            regularize = False
-        
-        # use stored values unless something passed
-        Ahat = Ahat if Ahat is not None else self.alpha
-        mhat = mhat if mhat is not None else self.mu
-        omega = omega if omega is not None else self.omega
-
-        N = len(seq)
-        dim = mhat.shape[0]
-        Tm = float(seq[-1,0]) if Tm < 0 else float(Tm)
-        sequ = seq[:,1].astype(int)
-
-        p_ii = np.random.uniform(0.01, 0.99, size=N)
-        p_ij = np.random.uniform(0.01, 0.99, size=(N, N))
-
-        t0 = T.time()
-
-        # PRECOMPUTATIONS
-        if verbose: print(f'Doing precomputations ... {T.time()-t0:.3f}')
-
-        # element-wise: diffs[i,j] = t_i - t_j for j < i (o.w. zero)
-        diffs = pairwise_distances(np.array([seq[:,0]]).T, metric = 'euclidean')
-        diffs[np.triu_indices(N)] = 0
-
-        # element-wise: kern[i,j] = omega*np.exp(-omega*diffs[i,j])
-        kern = omega*np.exp(-omega*diffs)
-
-        # rowidx, colidx to allow numpy fancy indexing on Ahat
-        colidx = np.tile(sequ.reshape((1,N)), (N,1))
-        rowidx = np.tile(sequ.reshape((N,1)), (1,N))
-
-        # indicator matrix for events
-        # S[i,j] = 1 if event i is of type j
-        S = np.zeros((N, dim), dtype=np.float32)
-        S[np.arange(N), sequ] = 1
-
-        # during training we need to compute the sum of the Gt kernel
-        # if we approximate G(T-t) = 1, then we can compute the sum of the kernel
-        # as the number of events of each type that have occurred before time t
-        p_ones = np.ones((N, N))
-        p_ones[np.triu_indices(N)] = 0
-        seqcnts = (S.T @ p_ones) @ S   # (dim, dim)
-        seqcnts[np.where(seqcnts == 0)] = 1  # hack to avoid div by zero
-
-        k = 0
-        old_LL = -10000   # log likelihood
-        while k < maxiter:
-            # compute A_{u_i,u_j} * G_{t_i,t_j}
-            Auu = Ahat[rowidx, colidx]
-            ag = np.multiply(Auu, kern)
-            ag[np.triu_indices(N)] = 0
-
-            # compute m_{u_i}
-            mu = mhat[sequ]
-
-            # compute total rates of u_i at time i
-            rates = mu + np.sum(a=ag, axis=1)
-
-            # compute matrix of p_ii and p_ij  (keep separate for later computations)
-            p_ij = np.divide(ag, np.tile(np.array([rates]).T, (1,N)))
-            p_ii = np.divide(mu, rates)
-
-            # compute mhat:  mhat_u = (\sum_{u_i=u} p_ii) / T
-            mhat = np.array([np.sum(p_ii[np.where(seq[:,1]==i)]) \
-                             for i in range(dim)]) / Tm
-            
-            if regularize:
-                Ahat = np.divide((S.T @ p_ij @ S) + (smx - 1), seqcnts + tmx)
-            else:
-                Ahat = np.divide(S.T @ p_ij @ S, seqcnts)
-
-            if k % 10 == 0:
-                term1 = np.sum(np.log(rates))
-                term2 = Tm * np.sum(mhat)
-                term3 = np.sum([
-                    np.sum([Ahat[u,int(seq[j,1])] for j in range(N)]) 
-                    for u in range(dim)
-                ])
-                new_LL = (1./N) * (term1 - term2 - term3)
-                if verbose:
-                    print(f'Iter {k} (LL: {new_LL}) ... {T.time()-t0:.3f}')
-                if stopping_criterion == 'll' and np.abs(old_LL - new_LL) < epsilon:
-                    print(f'Reached stopping criterion ... {T.time()-t0:.3f}')
-                    break
-                old_LL = new_LL
-
-            k += 1
-
-        print(f'Reached max iter {maxiter} (LL: {new_LL}) ... {T.time()-t0:.3f}')
-
-        self.Ahat = Ahat
-        self.mhat = mhat
-        
-        return Ahat, mhat, p_ii, p_ij
-
-# -----------
-# Plotting utility functions
-# -----------
-
-def plot_events_and_rates(mhp=None, data=None, horizon=None):
-
-    horizon = np.amax(data[:,0]) if horizon is None else horizon
-    dim = mhp.dim
-
-    f, axarr = plt.subplots(
-        dim*2, 1, 
-        sharex='col', 
-        gridspec_kw={'height_ratios':sum([[3,1] for i in range(dim)],[])}, 
-        figsize=(8, dim*2)
-    )
-
-    xs = np.linspace(0, horizon, int(horizon*10))
-    for i in range(dim):
-        row = i * 2
-
-        # plot rate
-        r = [mhp.get_rate(data, ct, i) for ct in xs]
-        axarr[row].plot(xs, r, 'k-')
-        axarr[row].set_ylim([-0.01, np.amax(r)+(np.amax(r)/2.)])
-        axarr[row].set_ylabel('$\lambda(t)_{%d}$' % i, fontsize=14)
-        r = []
-
-        # plot events
-        subseq = data[data[:,1]==i][:,0]
-        axarr[row+1].plot(subseq, np.zeros(len(subseq)) - 0.5, 'bo', alpha=0.2)
-        axarr[row+1].yaxis.set_visible(False)
-        axarr[row+1].set_xlim([0, horizon])
-
-    plt.tight_layout()
-
-def plot_events(data, horizon=-1, labeled=True):
-    if horizon < 0:
-        horizon = np.amax(data[:,0])
-    dim = int(np.amax(data[:,1])) + 1
-
-    fig, ax = plt.subplots(1, 1, figsize=(10,2))
-
-    for i in range(dim):
-        subseq = data[data[:,1]==i][:,0]
-        plt.plot(subseq, np.zeros(len(subseq)) - i, 'bo', alpha=0.2)
-
-    if labeled:
-        ax.set_yticklabels('')
-        ax.set_yticks(-np.arange(0, dim), minor=True)
-        ax.set_yticklabels([r'$e_{%d}$' % i for i in range(dim)], minor=True)
-    else:
-        ax.yaxis.set_visible(False)
-
-    ax.set_xlim([0,horizon])
-    ax.set_ylim([-dim, 1])
-    ax.set_xlabel('t')
-    # plt.tight_layout()
+batch = BatchedMVEventData(t, e)
+# %%
+hp = ExpKernelMVHawkesProcess(None, D=2)
+# %%
+hp.positive_likelihood(batch)
+# %%
