@@ -4,11 +4,98 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 
 from event_utils import MVEventData, inverse_softplus
+from torch import Tensor
+from tensordict import TensorDict
+
 
 # %%
+class BatchedMVEventData(TensorDict):
+    def __init__(self, time_points: list[Tensor], event_types: list[Tensor], sort: bool = False):
+        assert isinstance(time_points, list)
+        assert isinstance(event_types, list)
+        assert len(time_points) == len(event_types)
+
+        batch_size = len(time_points)
+
+        for t, e in zip(time_points, event_types):
+            assert t.dim() == 1
+            assert e.dim() == 1
+            assert t.shape == e.shape
+
+        # Assert time_points have float type
+        assert time_points[0].dtype.is_floating_point
+        # Assert event_types have integer type
+        assert not event_types[1].dtype.is_floating_point
+
+        if sort:
+            for i in range(len(time_points)):
+                sorted_indices = torch.argsort(time_points[i])
+                time_points[i] = time_points[i][sorted_indices]
+                event_types[i] = event_types[i][sorted_indices]
+
+        lengths = [len(b) for b in time_points]
+        length = max(lengths)
+        device = time_points[0].device
+        dtype_time = time_points[0].dtype
+        dtype_event = event_types[0].dtype
+
+        padded_time_points = torch.full((batch_size, length), float("inf"), dtype=dtype_time, device=device)
+        padded_event_types = torch.full((batch_size, length), -1, dtype=dtype_event, device=device)
+
+        for i, (t, e) in enumerate(zip(time_points, event_types)):
+            n = len(t)
+            padded_time_points[i, :n] = t
+            padded_event_types[i, :n] = e
+
+        super().__init__(
+            {"time_points": padded_time_points, "event_types": padded_event_types}, batch_size=(batch_size, length)
+        )
+
+    @property
+    def time_points(self):
+        return self["time_points"]
+
+    @property
+    def event_types(self):
+        return self["event_types"]
+
+    def __iter__(self):
+        # Iteration yields a tuple for each event
+        for i in range(len(self)):
+            yield self.time_points[i], self.event_types[i]
+
+    # def __repr__(self):
+
+    #     def abbrev(tensor, max_len=8, float_fmt="{:.2f}"):
+    #         l = tensor.tolist()
+    #         if tensor.dtype.is_floating_point:
+    #             l = [float_fmt.format(v) for v in l]
+    #         else:
+    #             l = [str(v) for v in l]
+    #         if len(l) > max_len:
+    #             return "[" + ", ".join(l[:4]) + ", ..., " + ", ".join(l[-3:]) + "]"
+    #         return "[" + ", ".join(l) + "]"
+
+    #     batch_size = self.time_points.shape[0]
+    #     length = self.time_points.shape[1]
+
+    #     if batch_size == 0:
+    #         return (
+    #             f"BatchedMVEventData(batch=0, len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
+    #             f"  time_points: {tps}\n"
+    #             f"  event_types: {ets}"
+    #         )
+
+    #     if batch_size in [0, 1]:
+    #         tps = abbrev(self.time_points)
+    #         ets = abbrev(self.event_types)
+    #     return (
+    #         f"BatchedMVEventData(len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
+    #         f"  time_points: {tps}\n"
+    #         f"  event_types: {ets}"
+    #     )
 
 
 @dataclass
@@ -239,9 +326,11 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
             relevant_beta = beta[:, ts.event_types]  # Shape: (D,B,N)
             contributions = relevant_alpha * (1 - torch.exp(-relevant_beta * delta_t))  # Shape: (D,B,N)
             contributions = contributions.permute(1, 2, 0)  # Shape (B,N,D)
-            contributions.masked_fill(~valid_mask.unsqueeze(-1), 0)  # Set non valid numbers to zero. Use broadcasting.
+            contributions = contributions.masked_fill(
+                ~valid_mask.unsqueeze(-1), 0
+            )  # Set non valid numbers to zero. Use broadcasting.
             contributions = contributions.permute(2, 0, 1)  # Shape: (D,B,N)
-            integral += torch.sum(contributions, dim=2)  # Shape: (D,B)
+            integral = integral + torch.sum(contributions, dim=2)  # Shape: (D,B)
         integral = integral.T
         return integral
 
@@ -258,19 +347,18 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         # Computes the time-difference matrix T.
         # $T_{b,i,j} = t_b,i - t_b,j$ if $i > j$ else 0
 
-        time_diffs = rearrange(ts.time_points, "b l -> b l 1") - rearrange(
-            ts.time_points, "b l -> b 1 l"
-        )  # Shape B N N
+        time_diffs = ts.time_points.unsqueeze(2) - ts.time_points.unsqueeze(1)  # Shape: (B, N, N)
 
         # Get receiver (j) types: (B, N) -> (B, N, 1)
-        receiver_types = rearrange(ts.event_types, "b l -> b l 1")
+        receiver_types = ts.event_types.unsqueeze(2)
 
         # Get trigger (i) types: (B, N) -> (B, 1, N)
-        trigger_types = rearrange(ts.event_types, "b l -> b 1 l")
+        trigger_types = ts.event_types.unsqueeze(1)
 
+        # Shape: D, (D,D), (D,D)
         mu, alpha, beta = self.transform_params()
 
-        # Create a matrix of shape (B, N, N) where each entry (b, i,j) corresponds to alpha_{receiver_types[b,i], trigger_types[b,j]}
+        # Create a matrix of shape (B, N, N) where each entry (b,i,j) corresponds to alpha_{receiver_types[b,i], trigger_types[b,j]}
         alpha_matrix = alpha[receiver_types, trigger_types]  # Shape: (B, N, N)
         beta_matrix = beta[receiver_types, trigger_types]  # Shape: (B, N, N)
 
@@ -282,9 +370,10 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
 
         # Mask out invalid events.
         valid_events = ts.event_types != -1
-        valid_event_mask = rearrange(valid_events, "B N -> B N 1") & rearrange(valid_events, "B N -> B 1 N")
-        # TODO Make sure multiplication works here. Maybe we need indexing.
-        interaction_terms *= valid_event_mask
+        valid_event_mask = valid_events.unsqueeze(2) & valid_events.unsqueeze(
+            1
+        )  # TODO Make sure multiplication works here. Maybe we need indexing.
+        interaction_terms[~valid_event_mask] = 0.0
 
         relevant_mu = mu[ts.event_types] * valid_events  # Shape (B,N)
 
@@ -294,8 +383,14 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
 
         # TODO make sure it works with empty event sequences for some batch elements.
         if log:
-            positive_likelihood = torch.sum(input=torch.log(intensities), dim=-1)  # Shape: (B,)
+            log_intensities = torch.log(intensities)
+            # Again screen out invalid contributions. Have been set to 0 before, but log of 0 is -inf...
+            # We set them to 0.0 so they dont contribute to the next sum.
+            log_intensities[~valid_events] = 0.0
+            positive_likelihood = torch.sum(input=log_intensities, dim=-1)  # Shape: (B,)
         else:
+            # Have to set the invalid events to 1.0, so they dont contribute to the product.
+            intensities[~valid_events] = 1.0
             positive_likelihood = torch.prod(intensities, dim=-1)  # Shape: (B,)
 
         return positive_likelihood
@@ -327,6 +422,7 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
 
         # TODO throw error when T <= last event time
         num_events = (ts.event_types != -1).sum(dim=1)
+        num_batches = ts.event_types.shape[0]
 
         # Positive likelihood
         # ----
@@ -549,106 +645,128 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
 
 # %%
 
-from event_utils import MVEventData
-from torch import Tensor
-from tensordict import TensorDict
+if __name__ == "__main__":
+    t = [torch.tensor([0.0, 0.2, 0.7, 0.8]), torch.tensor([0.6, 0.6, 0.9]), torch.tensor([])]
+    e = [
+        torch.tensor([0, 1, 0, 0], dtype=torch.long),
+        torch.tensor([1, 1, 1], dtype=torch.long),
+        torch.tensor([], dtype=torch.long),
+    ]
 
+    mv_list = [MVEventData(tt, ee) for tt, ee in zip(t, e)]
+    batch = BatchedMVEventData(t, e)
+    # %%
+    hp = ExpKernelMVHawkesProcess(None, D=2)
+    from hawkes_torch import MultiVariateHawkesProcess, Params
 
-class BatchedMVEventData(TensorDict):
-    def __init__(self, time_points: list[Tensor], event_types: list[Tensor], sort: bool = False):
-        assert isinstance(time_points, list)
-        assert isinstance(event_types, list)
-        assert len(time_points) == len(event_types)
+    m, a, b = hp.transform_params()
+    hp_org = MultiVariateHawkesProcess(Params(m, a, b))
 
-        batch_size = len(time_points)
+    # %%
+    hp_poslik = hp.positive_likelihood(batch)
+    hp_org_poslik = torch.stack([hp_org._positive_likelihood_vectorized(ts) for ts in mv_list])
+    print(hp_poslik, hp_org_poslik, hp_poslik.allclose(hp_org_poslik))
+    # %%
+    int_batch = hp.integral_exp_kernel(T=1.0, ts=batch)
+    int_org = torch.stack([hp_org.integral_exp_kernel(T=1.0, ts=ts) for ts in mv_list])
+    print(int_batch, int_org, (int_batch == int_org).all())
+    # %%
+    hp.likelihood(batch, T=1.0, log=False)
+    # %%
+    [hp_org.likelihood(ts, T=1.0, log=False) for ts in mv_list]
+    # %%
+    # Benchmark speed
+    import numpy as np
 
-        for t, e in zip(time_points, event_types):
-            assert t.dim() == 1
-            assert e.dim() == 1
-            assert t.shape == e.shape
+    D = 1000
+    max_len = 80
+    num_seq = 20000
+    max_T = 80
+    batch_size = 2000
+    number = 3
+    device = "cuda:0"
+    # %%
+    sequences = []
 
-        # Assert time_points have float type
-        assert time_points[0].dtype.is_floating_point
-        # Assert event_types have integer type
-        assert not event_types[1].dtype.is_floating_point
+    for i in range(num_seq):
+        # Uniformly draw the lenght of the sequence.
+        l = np.random.randint(0, max_len)
+        T = np.random.rand() * max_T
 
-        if sort:
-            for i in range(len(time_points)):
-                sorted_indices = torch.argsort(time_points[i])
-                time_points[i] = time_points[i][sorted_indices]
-                event_types[i] = event_types[i][sorted_indices]
+        time_points = np.random.rand(l) * T
+        time_points = np.sort(time_points)
+        T += 1
 
-        lengths = [len(b) for b in time_points]
-        length = max(lengths)
-        device = time_points[0].device
-        dtype_time = time_points[0].dtype
-        dtype_event = event_types[0].dtype
+        event_types = np.random.randint(0, D, l)
 
-        padded_time_points = torch.full((batch_size, length), float("inf"), dtype=dtype_time, device=device)
-        padded_event_types = torch.full((batch_size, length), -1, dtype=dtype_event, device=device)
+        sequences.append((torch.tensor(time_points), torch.tensor(event_types, dtype=torch.long)))
 
-        for i, (t, e) in enumerate(zip(time_points, event_types)):
-            n = len(t)
-            padded_time_points[i, :n] = t
-            padded_event_types[i, :n] = e
+    # %%
+    batched_hp = ExpKernelMVHawkesProcess(None, D=D)
+    batched_hp.ensure_stability()
+    m, a, b = batched_hp.transform_params()
+    iter_hp = MultiVariateHawkesProcess(Params(m, a, b), D=D)
+    # %%
+    mv_events = [MVEventData(t, e) for t, e in sequences]
 
-        super().__init__(
-            {"time_points": padded_time_points, "event_types": padded_event_types}, batch_size=(batch_size, length)
-        )
+    batched_mv_events = []
+    for start in range(0, num_seq, batch_size):
+        end = min(start + batch_size, len(sequences))
+        subset = sequences[start:end]
+        ts = [s[0] for s in subset]
+        es = [s[1] for s in subset]
+        batch = BatchedMVEventData(ts, es)
+        batched_mv_events.append(batch)
+    # %%
 
-    @property
-    def time_points(self):
-        return self["time_points"]
+    def org_likelihood(mv_events, hp, T, device):
+        l = []
+        for ts in mv_events:
+            l.append(hp.likelihood(ts.to(device), T.to(device)))
+        return l
 
-    @property
-    def event_types(self):
-        return self["event_types"]
+    def new_likelihood(batched_mv_events, hp, T, device):
+        l = []
+        for batch in batched_mv_events:
+            l.append(hp.likelihood(batch.to(device), T.to(device)))
+        return l
 
-    def __iter__(self):
-        # Iteration yields a tuple for each event
-        for i in range(len(self)):
-            yield self.time_points[i], self.event_types[i]
+    # %%
+    import time
 
-    # def __repr__(self):
+    iter_hp = iter_hp
+    batched_hp = batched_hp
 
-    #     def abbrev(tensor, max_len=8, float_fmt="{:.2f}"):
-    #         l = tensor.tolist()
-    #         if tensor.dtype.is_floating_point:
-    #             l = [float_fmt.format(v) for v in l]
-    #         else:
-    #             l = [str(v) for v in l]
-    #         if len(l) > max_len:
-    #             return "[" + ", ".join(l[:4]) + ", ..., " + ", ".join(l[-3:]) + "]"
-    #         return "[" + ", ".join(l) + "]"
+    # mv_events = [e.cuda() for e in mv_events]
+    # batched_mv_events = [e.cuda() for e in batched_mv_events]
 
-    #     batch_size = self.time_points.shape[0]
-    #     length = self.time_points.shape[1]
+    T_ = torch.tensor(max_T + 1)
 
-    #     if batch_size == 0:
-    #         return (
-    #             f"BatchedMVEventData(batch=0, len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
-    #             f"  time_points: {tps}\n"
-    #             f"  event_types: {ets}"
-    #         )
+    # %%
 
-    #     if batch_size in [0, 1]:
-    #         tps = abbrev(self.time_points)
-    #         ets = abbrev(self.event_types)
-    #     return (
-    #         f"BatchedMVEventData(len={length}, [{self.time_points.dtype}, {self.event_types.dtype}])\n"
-    #         f"  time_points: {tps}\n"
-    #         f"  event_types: {ets}"
-    #     )
+    org_speed = []
+    batch_speed = []
 
+    print("Start measurement")
 
-# %%
+    iter_hp = iter_hp.to(device)
+    batched_hp = batched_hp.to(device)
 
-t = [torch.tensor([0.0, 0.2, 0.7]), torch.tensor([0.6, 0.7]), torch.tensor([])]
-e = [torch.tensor([0, 1, 0]), torch.tensor([1, 1]), torch.tensor([])]
+    for i in range(number):
+        print(f"Measurement: {i}")
 
-batch = BatchedMVEventData(t, e)
-# %%
-hp = ExpKernelMVHawkesProcess(None, D=2)
-# %%
-hp.positive_likelihood(batch)
-# %%
+        with torch.no_grad():
+            start = time.time()
+            _ = new_likelihood(batched_mv_events, batched_hp, T_, device=device)
+            end = time.time()
+            batch_speed.append(end - start)
+
+        with torch.no_grad():
+            start = time.time()
+            _ = org_likelihood(mv_events, iter_hp, T_, device=device)
+            end = time.time()
+            org_speed.append(end - start)
+
+    print(np.mean(org_speed), np.min(org_speed), np.max(org_speed))
+    print(np.mean(batch_speed), np.min(batch_speed), np.max(batch_speed))
+    # %%
