@@ -251,20 +251,18 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
     def integral_exp_kernel(self, T: torch.Tensor, ts: BatchedMVEventData):
         mu, alpha, beta = self.transform_params()
 
-        valid_mask = ts.event_types != -1
+        valid_mask = ts.event_types != -1  # Shape: (B,N)
         integral = mu.unsqueeze(1) * T.unsqueeze(0)  # Shape: (D,B)
 
         if len(ts) > 0:
             # Vectorized multivariate implementation
             delta_t = (T.unsqueeze(1) - ts.time_points).unsqueeze(0)  # Shape: (1,B,N)
+            delta_t = torch.where(valid_mask.unsqueeze(0), delta_t, torch.zeros_like(delta_t))
+
             relevant_alpha = alpha[:, ts.event_types]  # Shape: (D,B,N)
             relevant_beta = beta[:, ts.event_types]  # Shape: (D,B,N)
             contributions = relevant_alpha * (1 - torch.exp(-relevant_beta * delta_t))  # Shape: (D,B,N)
-            contributions = contributions.permute(1, 2, 0)  # Shape (B,N,D)
-            contributions = contributions.masked_fill(
-                ~valid_mask.unsqueeze(-1), 0
-            )  # Set non valid numbers to zero. Use broadcasting.
-            contributions = contributions.permute(2, 0, 1)  # Shape: (D,B,N)
+            contributions = contributions.masked_fill(~valid_mask.unsqueeze(0), 0)
             integral = integral + torch.sum(contributions, dim=2)  # Shape: (D,B)
         integral = integral.T
         return integral
@@ -279,10 +277,15 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         # Shape ts: [batch_size, len]
         # ts arrays are right padded. np.inf for time and -1 for type
 
+        # Identify valid (non-padded) events
+        valid_events = ts.event_types != -1
+        valid_event_mask = valid_events.unsqueeze(2) & valid_events.unsqueeze(1)
+
         # Computes the time-difference matrix T.
         # $T_{b,i,j} = t_b,i - t_b,j$ if $i > j$ else 0
-
         time_diffs = ts.time_points.unsqueeze(2) - ts.time_points.unsqueeze(1)  # Shape: (B, N, N)
+        # Set time_diffs to 0, where we have interactions with padded events (can results in +-inf or NaN).
+        time_diffs_safe = torch.where(valid_event_mask, time_diffs, torch.zeros_like(time_diffs))
 
         # Get receiver (j) types: (B, N) -> (B, N, 1)
         receiver_types = ts.event_types.unsqueeze(2)
@@ -294,18 +297,23 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         mu, alpha, beta = self.transform_params()
 
         # Create a matrix of shape (B, N, N) where each entry (b,i,j) corresponds to alpha_{receiver_types[b,i], trigger_types[b,j]}
-        alpha_matrix = alpha[receiver_types, trigger_types]  # Shape: (B, N, N)
-        beta_matrix = beta[receiver_types, trigger_types]  # Shape: (B, N, N)
+        alpha_matrix = alpha[receiver_types, trigger_types].clone()  # Shape: (B, N, N)
+        beta_matrix = beta[receiver_types, trigger_types].clone()  # Shape: (B, N, N)
 
         # Compute the kernel values for all time differences
-        interaction_terms = alpha_matrix * beta_matrix * torch.exp(-beta_matrix * time_diffs)  # Shape: (B,N, N)
+        # We include clamping to avoid underflows.
+        # Formula: alpha * beta * exp(-beta * dt)
+        exponent = -beta_matrix * time_diffs_safe
+        # Clamp exponent to avoid overflow/underflow. Should not happen, just to be sure.
+        exponent = torch.clamp(exponent, min=-20, max=0)
+        exp_kernel = torch.exp(exponent)
+        interaction_terms = alpha_matrix * beta_matrix * exp_kernel  # Shape: (B,N, N)
+
         interaction_terms = torch.tril(
             interaction_terms, diagonal=-1
         )  # Zero out diagonal and above, to ensure causality. This works also with batched matrices.
 
         # Mask out invalid events.
-        valid_events = ts.event_types != -1
-        valid_event_mask = valid_events.unsqueeze(2) & valid_events.unsqueeze(1)
         interaction_terms[~valid_event_mask] = 0.0
 
         relevant_mu = mu[ts.event_types] * valid_events  # Shape (B,N)
@@ -314,11 +322,9 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         # For this we sum the rows. To get the intensities we also add the correct mu values.
         intensities = relevant_mu + torch.sum(interaction_terms, dim=2)  # Shape: (B,N,)
 
-        # TODO make sure it works with empty event sequences for some batch elements.
+        min_intensity = 1e-12
         if log:
             # Clamp intensities to avoid log(0) = -inf or log(negative) = nan
-            # Only clamp valid events; invalid events will be set to 0 after log
-            min_intensity = 1e-7
             intensities_clamped = torch.clamp(intensities, min=min_intensity)
             log_intensities = torch.log(intensities_clamped)
             # Screen out invalid contributions. Set them to 0.0 so they dont contribute to the next sum.
@@ -327,14 +333,13 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         else:
             # Have to set the invalid events to 1.0, so they dont contribute to the product.
             # Also clamp to ensure non-negative intensities
-            intensities = torch.clamp(intensities, min=0.0)
+            intensities = torch.clamp(intensities, min=min_intensity)
             intensities[~valid_events] = 1.0
             positive_likelihood = torch.prod(intensities, dim=-1)  # Shape: (B,)
 
-        # TODO not sure if we have to keep this.
         # Mask out event sequences with no elements. They only contribute negativly.
-        # num_0 = (ts.event_types == -1).sum(dim=1) == 0
-        # positive_likelihood[num_0] = torch.tensor(0.0) if log else torch.tensor(1.0)
+        num_0 = valid_events.sum(dim=1) == 0
+        positive_likelihood[num_0] = torch.tensor(0.0) if log else torch.tensor(1.0)
 
         return positive_likelihood
 
