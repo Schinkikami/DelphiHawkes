@@ -22,9 +22,7 @@ requires-python = ">=3.11"
 dependencies = [
     "einops>=0.8.1",
     "ipykernel>=7.1.0",
-    "jax[cuda13]>=0.5.3",
     "jaxtyping>=0.3.3",
-    "lax>=1.0.0",
     "matplotlib>=3.10.7",
     "numpy<2.0",
     "pandas>=2.3.3",

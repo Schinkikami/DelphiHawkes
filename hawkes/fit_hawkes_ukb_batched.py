@@ -4,17 +4,17 @@ from typing import Optional
 import torch
 import numpy as np
 from tqdm import tqdm
-from hawkes import ExpKernelMVHawkesProcess
+from Hawkes import ExpKernelMVHawkesProcess
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-from event_utils import MVEventData
+from event_utils import MVEventData, BatchedMVEventData
+from ukb_loading import load_ukb_sequences
 # %%
 
 
 def batched_train_loop(
     model: ExpKernelMVHawkesProcess,
     events_batch: DataLoader,
-    T: float,
     test_events: Optional[DataLoader] = None,
     num_steps=100,
     step_size=0.01,
@@ -30,7 +30,6 @@ def batched_train_loop(
     global_step = 0
     epoch = 0
 
-    T = torch.tensor(T).cuda()
     progress_bar = tqdm(total=num_steps)
 
     while True:
@@ -38,31 +37,37 @@ def batched_train_loop(
         epoch += 1
 
         for step, batch in enumerate(events_batch):
+            T = batch.max_time + (1 / 365)
             batch = batch.cuda()
-
+            T = T.to(batch.device)
             optim.zero_grad()
             ll = model.likelihood(batch, T)
+            ll = torch.mean(ll)
             nll = -ll
             nll.backward()
             last_ll = ll.item()
             likelihoods.append(ll.item())
             optim.step()
-            with torch.no_grad():
-                model.ensure_stability()
+            # with torch.no_grad():
+            #    model.ensure_stability()
 
             if test_events is not None and (step % eval_freq == 0 or step == num_steps - 1):
                 with torch.no_grad():
-                    test_lls = []
-                    for test_batch in test_events:
-                        test_batch = test_batch.cuda()
-                        batch_ll = model.likelihood(test_batch, T)
-                        test_lls.append(batch_ll.detach().cpu())
-                        last_test_ll = batch_ll.item()
-                    test_ll = torch.sum(torch.stack(test_lls))
-                    print(f" Step {step}, Test LL (normed): {test_ll.item() / len(test_events)}")
-                    test_likelihoods.append(test_ll.item())
-                    if save_file_name is not None:
-                        torch.save(model.state_dict(), save_file_name)
+                    val_lls = []
+                    for val_batch in test_events:
+                        T = val_batch.max_time + (1 / 365)
+                        val_batch = val_batch.cuda()
+                        T = T.to(val_batch.device)
+
+                        batch_val_lls = model.likelihood(val_batch, T)
+                        batch_val_lls = torch.sum(batch_val_lls)
+                        val_lls.append(batch_val_lls.item())
+                        last_test_ll = batch_val_lls.item()
+                    val_ll = torch.sum(torch.tensor(val_lls))
+                    print(f" Step {step}, Test LL (normed): {val_ll.item() / len(test_events)}")
+                    test_likelihoods.append(val_ll.item())
+                    # if save_file_name is not None:
+                    #    torch.save(model.state_dict(), save_file_name)
 
             global_step += 1
             # Update the progress bar description and metrics
@@ -79,42 +84,20 @@ def batched_train_loop(
 
 
 # %%
-# Load some real data
-data_path = Path("../data/ukb_simulated_data/train.bin")
-assert data_path.exists(), "Data file does not exist."
-np_data = np.memmap(str(data_path), mode="r", dtype=np.uint32).reshape(-1, 3)
 
-batch_ids = np_data[:, 0].astype(int)
-time_points = np_data[:, 1].astype(float)
-event_types = np_data[:, 2].astype(int)
+# Load UKB data
+data_path = Path("../data/ukb_simulated_data/expansion.bin")
+sequences, sexes, num_event_types = load_ukb_sequences(data_path)
 
-unique_org_event_ids = np.unique(event_types)
-num_event_types = len(unique_org_event_ids)
-# Remap event types to contiguous ids
-event_type_mapping = {orig_id: new_id for new_id, orig_id in enumerate(unique_org_event_ids)}
-event_types = np.array([event_type_mapping[et] for et in event_types], dtype=int)
+# %%
+LIMIT_DATSET_SIZE = 100000
 
-# Transform time to years
-time_points = time_points / 365.0
-
-# Split data by batch id
-all_events_real = []
-for b_id in np.unique(batch_ids):
-    mask = batch_ids == b_id
-    ev_data = MVEventData(
-        time_points=torch.tensor(time_points[mask], dtype=torch.float32),
-        event_types=torch.tensor(event_types[mask], dtype=torch.long),
-        sort=True,
-    )
-    all_events_real.append(ev_data)
+sequences = sequences[:LIMIT_DATSET_SIZE]
+sexes = sexes[:LIMIT_DATSET_SIZE]
 
 # Take 20% of the data as test set and 10% as validatation set.
 
-
-# %%
-
-
-indices = np.arange(len(all_events_real))
+indices = np.arange(len(sequences))
 
 TEST_RATIO = 0.20
 VALIDATION_RATIO = 0.10
@@ -131,9 +114,9 @@ train_indices, validation_indices = train_test_split(
     shuffle=False,
 )
 
-train_sequences = [all_events_real[i] for i in train_indices]
-validation_sequences = [all_events_real[i] for i in validation_indices]
-test_sequences = [all_events_real[i] for i in test_indices]
+train_sequences = [sequences[i] for i in train_indices]
+validation_sequences = [sequences[i] for i in validation_indices]
+test_sequences = [sequences[i] for i in test_indices]
 # %%
 
 from torch.utils.data import DataLoader
@@ -153,13 +136,13 @@ class ListDataset(torch.utils.data.Dataset):
 
 
 def collate_batch(mv_l: list[MVEventData]):
-    time_points = [t.time_points for ts in mv_l]
-    event_types = [t.event_types for ts in mv_l]
+    time_points = [ts.time_points for ts in mv_l]
+    event_types = [ts.event_types for ts in mv_l]
 
     return BatchedMVEventData(time_points, event_types)
 
 
-dataset_train = ListDataset(all_events_real)
+dataset_train = ListDataset(sequences)
 dataset_val = ListDataset(validation_sequences)
 dataset_test = ListDataset(test_sequences)
 
@@ -169,9 +152,10 @@ dataloader_test = DataLoader(dataset=dataset_test, batch_size=BATCH_SIZE, shuffl
 
 
 # %%
-D = int(event_types.max() + 1)  # Number of event types
-T = max(time_points) + 1.0  # Maximum simulation time
-N = len(all_events_real)  # Number of time-series
+D = int(num_event_types)  # Number of event types
+sequence_length = torch.tensor([ts.time_points[-1] for ts in sequences])
+T = sequence_length + (1 / 365)
+N = len(sequences)  # Number of time-series
 
 load_path = None
 if load_path is not None and load_path.exists():
@@ -182,39 +166,33 @@ if load_path is not None and load_path.exists():
 else:
     real_MVHP = ExpKernelMVHawkesProcess(None, D, seed=43)
 
-cuda_real_MVHP = real_MVHP.cuda()
+real_MVHP = real_MVHP.cuda()
 # %%
 
-init_ll_train = torch.mean(torch.stack([real_MVHP.likelihood(ts=ev, T=T) for ev in train_sequences]))
-init_ll_val = torch.mean(torch.stack([real_MVHP.likelihood(ts=ev, T=T) for ev in validation_sequences]))
-init_ll_test = torch.mean(torch.stack([real_MVHP.likelihood(ts=ev, T=T) for ev in test_sequences]))
-
-print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train.item()}")
-print(f"Baseline log-likelihood of init model on val dataset: {init_ll_val.item()}")
-print(f"Baseline log-likelihood of init model on test dataset: {init_ll_test.item()}")
-
-# %%
 with torch.no_grad():
-    ll = torch.sum(
-        torch.stack(
-            [
-                cuda_real_MVHP.likelihood(
-                    all_events_real[i].cuda(), T=torch.tensor(data=T).cuda(), num_integration_points=0
-                )
-                for i in range(1000)
-            ]
+    init_ll_train = torch.mean(
+        input=torch.cat(
+            [real_MVHP.likelihood(ts=ev.cuda(), T=ev.max_time.cuda() + (1 / 365)) for ev in dataloader_train]
         )
-    )
-    print(f"Log-likelihood: {ll.item()}")
+    ).item()
+    init_ll_val = torch.mean(
+        torch.cat([real_MVHP.likelihood(ts=ev.cuda(), T=ev.max_time.cuda() + (1 / 365)) for ev in dataloader_val])
+    ).item()
+    init_ll_test = torch.mean(
+        torch.cat([real_MVHP.likelihood(ts=ev.cuda(), T=ev.max_time.cuda() + (1 / 365)) for ev in dataloader_test])
+    ).item()
+
+print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train}")
+print(f"Baseline log-likelihood of init model on val dataset: {init_ll_val}")
+print(f"Baseline log-likelihood of init model on test dataset: {init_ll_test}")
 
 # %%
 step_size = 1e-4
 num_steps = 100
 
-fit_model, train_lls, val_lls = basic_train_loop(
-    cuda_real_MVHP,
+fit_model, train_lls, val_lls = batched_train_loop(
+    real_MVHP,
     dataloader_train,
-    torch.tensor(T).cuda(),
     dataloader_val,
     num_steps=num_steps,
     step_size=step_size,
@@ -222,7 +200,7 @@ fit_model, train_lls, val_lls = basic_train_loop(
 )
 # %%
 # Implement loading and saving of mode
-torch.save(fit_model.state_dict(), "models/first_mv_hawkes_model.pth")
+torch.save(fit_model.state_dict(), "models/first_batched_mv_hawkes_model.pth")
 # %%
 fit_model.cpu().sample(0, 80.0)
 # %%
