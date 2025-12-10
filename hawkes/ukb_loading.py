@@ -6,6 +6,7 @@ from event_utils import MVEventData
 
 def load_ukb_sequences(
     data_path: str | Path,
+    limit_size,
 ):
     data_path = Path(data_path)
     assert data_path.exists(), "Data file does not exist."
@@ -28,7 +29,7 @@ def load_ukb_sequences(
     num_events = death_token + 1
 
     time_points = time_points / 365.0  # Convert to years
-
+    time_points /= 80  # Encode in 80 years to have be better numerical stability.
     # Split data by batch id
     sequences = []
 
@@ -36,6 +37,8 @@ def load_ukb_sequences(
     change_idcs = np.flatnonzero(batch_ids_np[1:] != batch_ids_np[:-1]) + 1
     change_idcs = np.concatenate([np.array([0]), change_idcs, np.array([len(batch_ids_np)])])
 
+    if limit_size is not None:
+        change_idcs = change_idcs[: limit_size + 1]
     for start, stop in zip(change_idcs[:-1], change_idcs[1:]):
         sequence_time = time_points[start:stop]
         sequence_event = event_types[start:stop]

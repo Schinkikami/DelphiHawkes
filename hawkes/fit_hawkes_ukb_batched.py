@@ -20,7 +20,9 @@ def batched_train_loop(
     step_size=0.01,
     eval_freq: float = 10,
     save_file_name: Optional[str] = None,
+    device: str = "cpu",
 ):
+    model = model.to(device=device)
     optim = torch.optim.AdamW(model.parameters(), lr=step_size, weight_decay=0.0)
     likelihoods = []
     test_likelihoods = []
@@ -38,8 +40,8 @@ def batched_train_loop(
 
         for step, batch in enumerate(events_batch):
             T = batch.max_time + (1 / 365)
-            batch = batch.cuda()
-            T = T.to(batch.device)
+            batch = batch.to(device)
+            T = T.to(device)
             optim.zero_grad()
             ll = model.likelihood(batch, T)
             ll = torch.mean(ll)
@@ -56,8 +58,8 @@ def batched_train_loop(
                     val_lls = []
                     for val_batch in test_events:
                         T = val_batch.max_time + (1 / 365)
-                        val_batch = val_batch.cuda()
-                        T = T.to(val_batch.device)
+                        val_batch = val_batch.to(device)
+                        T = T.to(device)
 
                         batch_val_lls = model.likelihood(val_batch, T)
                         batch_val_lls = torch.sum(batch_val_lls)
@@ -86,14 +88,12 @@ def batched_train_loop(
 # %%
 
 # Load UKB data
-data_path = Path("../data/ukb_simulated_data/expansion.bin")
-sequences, sexes, num_event_types = load_ukb_sequences(data_path)
+LIMIT_DATSET_SIZE = 500000
+
+data_path = Path("./data/ukb_simulated_data/expansion.bin")
+sequences, sexes, num_event_types = load_ukb_sequences(data_path, limit_size=LIMIT_DATSET_SIZE)
 
 # %%
-LIMIT_DATSET_SIZE = 100000
-
-sequences = sequences[:LIMIT_DATSET_SIZE]
-sexes = sexes[:LIMIT_DATSET_SIZE]
 
 # Take 20% of the data as test set and 10% as validatation set.
 
@@ -121,7 +121,7 @@ test_sequences = [sequences[i] for i in test_indices]
 
 from torch.utils.data import DataLoader
 
-BATCH_SIZE = 512
+BATCH_SIZE = 1000
 
 
 class ListDataset(torch.utils.data.Dataset):
@@ -152,6 +152,8 @@ dataloader_test = DataLoader(dataset=dataset_test, batch_size=BATCH_SIZE, shuffl
 
 
 # %%
+
+DEVICE = torch.device("cuda:0")
 D = int(num_event_types)  # Number of event types
 sequence_length = torch.tensor([ts.time_points[-1] for ts in sequences])
 T = sequence_length + (1 / 365)
@@ -166,20 +168,18 @@ if load_path is not None and load_path.exists():
 else:
     real_MVHP = ExpKernelMVHawkesProcess(None, D, seed=43)
 
-real_MVHP = real_MVHP.cuda()
+real_MVHP = real_MVHP
 # %%
 
 with torch.no_grad():
     init_ll_train = torch.mean(
-        input=torch.cat(
-            [real_MVHP.likelihood(ts=ev.cuda(), T=ev.max_time.cuda() + (1 / 365)) for ev in dataloader_train]
-        )
+        input=torch.cat([real_MVHP.likelihood(ts=ev, T=ev.max_time + (1 / 365)) for ev in dataloader_train])
     ).item()
     init_ll_val = torch.mean(
-        torch.cat([real_MVHP.likelihood(ts=ev.cuda(), T=ev.max_time.cuda() + (1 / 365)) for ev in dataloader_val])
+        torch.cat([real_MVHP.likelihood(ts=ev, T=ev.max_time + (1 / 365)) for ev in dataloader_val])
     ).item()
     init_ll_test = torch.mean(
-        torch.cat([real_MVHP.likelihood(ts=ev.cuda(), T=ev.max_time.cuda() + (1 / 365)) for ev in dataloader_test])
+        torch.cat([real_MVHP.likelihood(ts=ev, T=ev.max_time + (1 / 365)) for ev in dataloader_test])
     ).item()
 
 print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train}")
@@ -197,6 +197,7 @@ fit_model, train_lls, val_lls = batched_train_loop(
     num_steps=num_steps,
     step_size=step_size,
     save_file_name="models/latest.pth",
+    device=DEVICE,
 )
 # %%
 # Implement loading and saving of mode
