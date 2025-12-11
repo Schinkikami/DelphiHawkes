@@ -12,6 +12,25 @@ from ukb_loading import load_ukb_sequences
 # %%
 
 
+def measure_likelihood(model, dataloader, device):
+    model = model.to(device)
+
+    lls = []
+
+    for batch in dataloader:
+        T = batch.max_time
+        batch = batch.to(device)
+        T = T.to(device)
+
+        with torch.no_grad():
+            ll = model.likelihood(batch, T)
+            lls.append(ll.detach().cpu())
+
+    lls = torch.cat(lls, dim=0)
+    model = model.cpu()
+    return lls
+
+
 def batched_train_loop(
     model: ExpKernelMVHawkesProcess,
     events_batch: DataLoader,
@@ -39,7 +58,7 @@ def batched_train_loop(
         epoch += 1
 
         for step, batch in enumerate(events_batch):
-            T = batch.max_time + (1 / 365)
+            T = batch.max_time
             batch = batch.to(device)
             T = T.to(device)
             optim.zero_grad()
@@ -88,9 +107,9 @@ def batched_train_loop(
 # %%
 
 # Load UKB data
-LIMIT_DATSET_SIZE = 500000
+LIMIT_DATSET_SIZE = 100000
 
-data_path = Path("./data/ukb_simulated_data/expansion.bin")
+data_path = Path("../data/ukb_simulated_data/expansion.bin")
 sequences, sexes, num_event_types = load_ukb_sequences(data_path, limit_size=LIMIT_DATSET_SIZE)
 
 # %%
@@ -171,30 +190,27 @@ else:
 real_MVHP = real_MVHP
 # %%
 
-with torch.no_grad():
-    init_ll_train = torch.mean(
-        input=torch.cat([real_MVHP.likelihood(ts=ev, T=ev.max_time + (1 / 365)) for ev in dataloader_train])
-    ).item()
-    init_ll_val = torch.mean(
-        torch.cat([real_MVHP.likelihood(ts=ev, T=ev.max_time + (1 / 365)) for ev in dataloader_val])
-    ).item()
-    init_ll_test = torch.mean(
-        torch.cat([real_MVHP.likelihood(ts=ev, T=ev.max_time + (1 / 365)) for ev in dataloader_test])
-    ).item()
+init_ll_train = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_train, device=DEVICE))
+init_ll_val = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_val, device=DEVICE))
+init_ll_test = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_test, device=DEVICE))
 
 print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train}")
 print(f"Baseline log-likelihood of init model on val dataset: {init_ll_val}")
 print(f"Baseline log-likelihood of init model on test dataset: {init_ll_test}")
 
 # %%
-step_size = 1e-4
-num_steps = 100
+step_size = 1e-6
+NUM_STEPS = 1000
 
+num_epochs_training = (NUM_STEPS * BATCH_SIZE) / len(sequences)
+print(f"Will train {num_epochs_training} epochs!")
+
+# %%
 fit_model, train_lls, val_lls = batched_train_loop(
     real_MVHP,
     dataloader_train,
     dataloader_val,
-    num_steps=num_steps,
+    num_steps=NUM_STEPS,
     step_size=step_size,
     save_file_name="models/latest.pth",
     device=DEVICE,
