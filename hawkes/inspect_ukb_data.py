@@ -2,7 +2,7 @@
 from pathlib import Path
 import torch
 import numpy as np
-from event_utils import MVEventData
+from .event_utils import MVEventData
 
 
 # %%

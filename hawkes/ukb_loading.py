@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 import torch
-from event_utils import MVEventData
+from .event_utils import MVEventData
 
 
 def load_ukb_sequences(

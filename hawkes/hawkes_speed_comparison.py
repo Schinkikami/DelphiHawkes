@@ -2,7 +2,7 @@
 import torch
 from Hawkes import ExpKernelMVHawkesProcess
 from hawkes_torch import MultiVariateHawkesProcess, Params
-from event_utils import *
+from .event_utils import *
 import numpy as np
 import time
 
@@ -42,7 +42,7 @@ with torch.no_grad():
     posll_batch = torch.cat([hp.positive_likelihood(batch) for batch in batched_mv_events])
     posll_org = torch.stack([hp_org._positive_likelihood_vectorized(ts) for ts in mv_events])
     print(posll_batch, posll_org, posll_batch.allclose(posll_org))
-    int_batch = torch.cat([hp.integral_exp_kernel(T=torch.tensor([max_T]), ts=batch) for batch in batched_mv_events])
+    int_batch = torch.cat([hp.cumulative_intensity(T=torch.tensor([max_T]), ts=batch) for batch in batched_mv_events])
     int_org = torch.stack([hp_org.integral_exp_kernel(T=max_T, ts=ts) for ts in mv_events])
     print(int_batch, int_org, int_batch.to(torch.float32).allclose(int_org))
     ll_batch = torch.cat([hp.likelihood(batch, T=torch.tensor([max_T]), log=True) for batch in batched_mv_events])

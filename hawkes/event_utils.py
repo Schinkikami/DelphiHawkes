@@ -3,6 +3,7 @@ from torch import Tensor
 import torch
 
 import numpy as np
+from typing import Optional
 
 
 class MVEventData(TensorDict):
@@ -70,22 +71,38 @@ class MVEventData(TensorDict):
 
 # %%
 class BatchedMVEventData(TensorDict):
-    def __init__(self, time_points: list[Tensor], event_types: list[Tensor], sort: bool = False):
-        assert isinstance(time_points, list)
-        assert isinstance(event_types, list)
-        assert len(time_points) == len(event_types)
+    def __init__(
+        self,
+        time_points: Optional[list[Tensor]] = None,
+        event_types: Optional[list[Tensor]] = None,
+        mv_events: Optional[list[MVEventData]] = None,
+        sort: bool = False,
+    ):
+        assert (time_points is not None and event_types is not None) or (mv_events is not None)
 
-        batch_size = len(time_points)
+        if mv_events:
+            assert isinstance(mv_events, list)
+            sort = False
+            time_points = [ts.time_points for ts in mv_events]
+            event_types = [ts.event_types for ts in mv_events]
+            batch_size = len(mv_events)
 
-        for t, e in zip(time_points, event_types):
-            assert t.dim() == 1
-            assert e.dim() == 1
-            assert t.shape == e.shape
+        else:
+            assert isinstance(time_points, list)
+            assert isinstance(event_types, list)
+            assert len(time_points) == len(event_types)
 
-        # Assert time_points have float type
-        assert time_points[0].dtype.is_floating_point
-        # Assert event_types have integer type
-        assert not event_types[1].dtype.is_floating_point
+            batch_size = len(time_points)
+
+            for t, e in zip(time_points, event_types):
+                assert t.dim() == 1
+                assert e.dim() == 1
+                assert t.shape == e.shape
+
+            # Assert time_points have float type
+            assert time_points[0].dtype.is_floating_point
+            # Assert event_types have integer type
+            assert not event_types[0].dtype.is_floating_point
 
         if sort:
             for i in range(len(time_points)):

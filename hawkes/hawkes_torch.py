@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from torch import tensor
 
-from event_utils import MVEventData
+from .event_utils import MVEventData
 from utils import inverse_softplus
 
 # %%

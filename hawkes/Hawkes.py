@@ -5,8 +5,8 @@ from typing import Literal, Optional
 import torch
 import torch.nn.functional as F
 
-from event_utils import MVEventData, BatchedMVEventData
-from utils import inverse_softplus
+from .event_utils import MVEventData, BatchedMVEventData
+from .utils import inverse_softplus, bracket_monotone, invert_monotone_newton
 
 
 # %%
@@ -226,13 +226,13 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
 
         self.log_alpha.data = inverse_softplus(alpha / ((1 / radius) * spectral_radius) - 1e-7)
 
-    def get_amplitude_decay(self):
-        _, alpha, beta = self.transform_params()
+    def get_baserate_amplitude_decay(self):
+        mu, alpha, beta = self.transform_params()
 
         amplitude = alpha * beta
         decay = beta
 
-        return amplitude, decay
+        return mu, amplitude, decay
 
     def transform_params(self, mu=True, alpha=True, beta=True):
         # Constrain parameters alpha and beta and mu to be positive
@@ -248,10 +248,69 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
 
         return tuple(parameters)
 
-    def integral_exp_kernel(self, T: torch.Tensor, ts: BatchedMVEventData):
+    def _unb_exp_kernel(self, delta_t: torch.Tensor, event_types: torch.Tensor):
+        # Warning: Unbatched!
+        # Returns pdf of exponential distribution with rate beta scaled by alpha
+        # This is a tensor of shape (D).
+        _, _alpha, _beta = self.transform_params()  # Shape: (D,D) and (D,D)
+        alpha = _alpha[:, event_types].T  # Shape: (N,D)
+        beta = _beta[:, event_types].T  # Shape: (N,D)
+
+        delta_t = delta_t.unsqueeze(-1)  # Shape: (N,1)
+
+        return (alpha * beta * torch.exp(-beta * delta_t)).T  # Shape: (D,N)
+
+    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData):
+        # Computes the intensity at time t for each batch.
+        # t can also be a vector.
+        # Returns intensity with shape (batch_size, D)
+
+        # lambda_d(t) = mu_d + \sum_d \sum_{t_i < t} \mathbb{1}(m_i == d) \phi_{d,m_i}(t-t_i)
+
         mu, alpha, beta = self.transform_params()
 
+        # Events in ts are sorted. We need to find the cutoff point i for each batch so that t_i < t < t_i+1
+        # As padding is with torch.inf, this always works.
+        idx_until_t = torch.searchsorted(ts.time_points, t.unsqueeze(-1)).squeeze(-1)
+
+        # Results in sequences of different lengths...
+        subsequences = [
+            MVEventData(ts.time_points[b, : idx_until_t[b]], ts.event_types[b, : idx_until_t[b]])
+            for b in range(len(idx_until_t))
+        ]
+
+        intensities = []
+
+        for tt, subsequence in zip(t, subsequences):
+            contributions = self._unb_exp_kernel(tt - subsequence.time_points, subsequence.event_types)  # Shape: (D,N)
+            intensity = mu + contributions.sum(dim=1)
+            intensities.append(intensity)
+
+        return torch.stack(intensities, dim=0)
+
+    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+        """
+        Computes the cumulative intensity function from t=0 up to T.
+        To obtain the cumulative intensity from t_n up to T, consider subtracting the CIs.
+
+        :param self: Description
+        :param T: Description
+        :type T: torch.Tensor
+        :param ts: Description
+        :type ts: BatchedMVEventData
+        """
+
         valid_mask = ts.event_types != -1  # Shape: (B,N)
+
+        # TODO if T <= ts.time_points.max(), we include future events with a negative effect.
+        # This is definitly a bug.
+        # TODO  Probably should also include a lower bound, so that I can always compute the integral from low to T.
+        # assert (
+        #    T >= torch.where(valid_mask, ts.time_points.clone(), torch.zeros_like(ts.time_points)).max(dim=1)[0]
+        # ).all()
+
+        mu, alpha, beta = self.transform_params()
+
         integral = mu.unsqueeze(1) * T.unsqueeze(0)  # Shape: (D,B)
 
         if len(ts) > 0:
@@ -266,6 +325,36 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
             integral = integral + torch.sum(contributions, dim=2)  # Shape: (D,B)
         integral = integral.T
         return integral
+
+    def PDF(self, T: torch.Tensor, ts: BatchedMVEventData):
+        """Returns the joint probability density function at T for every type E: p(t=T, e=E|H_t_).
+        args:
+            T: torch.Tensor = Points where to evaluate the PDF. Shape: (batch_size)
+            ts:BatchedMVEventData = A batch of padded sequences of size (batch_size, sequence_length)
+
+        returns:
+            pdfs: torch.Tensor = The PDF per batch element at the batch specific time point T[i] for each type e. p(t=T, e=E|H_t_).
+        """
+        # TODO changed here from the previous version, where lambda(t,k)*exp(-ci(t,k)) to lambda(t,k)*exp(-sum_k (ci(t,k)))
+        intensities = self.intensity(T, ts)  # Shape: (B,D)
+        ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B,D)
+        pdfs = intensities * torch.exp(-torch.sum(ci, dim=1))  # Shape: (B,)
+        return pdfs
+
+    def CDF(self, T: torch.Tensor, ts: BatchedMVEventData):
+        """Returns the cumulative density function at T for any event.
+        So this is the CDF of the marginal over all types of the joint distribution.
+        Defining CDF(T,E) does not make sense: p(t < T, e < E) for categorical E's?
+        args:
+            T: torch.Tensor = Points where to evaluate the CDF. Shape: (batch_size)
+            ts:BatchedMVEventData = A batch of padded sequences of size (batch_size, sequence_length)
+
+        returns:
+            cdfs: torch.Tensor = The CDF per batch element at the batch specific time point T[i].
+        """
+        ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B,D)
+        cdfs = 1 - torch.exp(-torch.sum(ci, dim=1))  # Shape: (B,)
+        return cdfs
 
     def positive_likelihood(
         self,
@@ -348,7 +437,7 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
     ):
         if num_integration_points == 0:
             # For the exponential kernel, we can compute the integral analytically.
-            integral = self.integral_exp_kernel(T=T, ts=ts)
+            integral = self.cumulative_intensity(T=T, ts=ts)
         else:
             raise RuntimeError("We should not be here.")
             # Rely on numerical integration.
@@ -403,62 +492,34 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         else:
             return positive_likelihood * negative_likelihood
 
-    def _integral_numerical(self, T: float, ts: MVEventData, num_integration_points: int = 1000):
+    def _eff_same_sequence_intensity(self, t: torch.Tensor, ts: MVEventData):
+        """
+        Efficient implementation of multiple intensity evaluations on a single sequence. Might need cleaning up later.
+        """
+        (mu,) = self.transform_params(alpha=False, beta=False)
+
+        included_events_idcs = torch.searchsorted(ts.time_points, t, right=False)
+
+        intensities = []
+
+        for tt, idx in zip(t, included_events_idcs):
+            seq = MVEventData(ts.time_points[:idx], ts.event_types[:idx])
+            contributions = self._unb_exp_kernel(tt - seq.time_points, seq.event_types)  # Shape: (D,N)
+            intensity = mu + contributions.sum(dim=1)
+            intensities.append(intensity)
+
+        return torch.stack(intensities, dim=0)
+
+    def _unb_integral_numerical(self, T: float, ts: MVEventData, num_integration_points: int = 1000):
         # Currently not used as we use the exponential kernel.
         # However, good for comparing performance for later kernels.
 
         if self.INTEGRATION_MODE == "trapezoidal":
             evaluation_points = torch.linspace(0, T, num_integration_points)
 
-            ## Find the indices of events to include at each evaluation point
-            ## Vectorized PyTorch implementation
-            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
-            ## Old loop-based implementation
-            # included_events_idcs = torch.zeros_like(evaluation_points, dtype=torch.long)
-            # curr_idx = 0
-            # for i,t in enumerate(evaluation_points):
-            #    #Only include events before time t
-            #    while curr_idx < len(ts) and ts.time_points[curr_idx] < t:
-            #        curr_idx += 1
-            #    included_events_idcs[i] = curr_idx
+            intensity_values = self._eff_same_sequence_intensity(evaluation_points, ts)
 
-            ## Compute intensity values at each evaluation point
-            ## Fast implementation.
-            intensity_values = torch.stack(
-                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
-            )  # Shape: (num_integration_points, D)
             integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
-
-            ## Old loop-based implementation
-            # for i, t in enumerate(evaluation_points):
-            #    #Only include events before time t
-            #    while included_events_idx < len(ts) and ts.time_points[included_events_idx] < t:
-            #        included_events_idx += 1
-            #    relevant_events = ts[:included_events_idx]
-            #    intensity_values[i] = self.intensity( t, relevant_events)
-            # integral = _trapz(intensity_values, evaluation_points)
-
-            return integral
-
-        elif self.INTEGRATION_MODE == "monte_carlo":
-            # Monte-Carlo integration
-            # Should not be used (high variance and unoptimized implementation)
-            # Raise warning on first use that it is not recommended.
-            if not hasattr(self, "_mc_warning_issued"):
-                print(
-                    "Warning: Monte Carlo integration mode is not recommended due to high variance and unoptimized implementation."
-                )
-                self._mc_warning_issued = True
-
-            rng = torch.Generator()
-
-            evaluation_points = T * torch.rand(size=(num_integration_points,), generator=rng)
-            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
-            intensity_values = torch.stack(
-                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
-            )  # Shape: (num_integration_points, D)
-
-            integral = (T / num_integration_points) * torch.sum(intensity_values)
 
             return integral
 
@@ -472,10 +533,7 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
             evaluation_points = torch.cat([torch.tensor([0.0]), evaluation_points, torch.tensor([T])])
             evaluation_points, _ = torch.sort(evaluation_points)
 
-            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
-            intensity_values = torch.stack(
-                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
-            )  # Shape: (num_integration_points, D)
+            intensity_values = self._eff_same_sequence_intensity(evaluation_points, ts)
 
             integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
 
@@ -484,106 +542,119 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         else:
             raise ValueError(f"Unknown INTEGRATION_MODE {self.INTEGRATION_MODE}")
 
-    def sample(self, Tstart: float, Tend: float, ts: Optional[MVEventData] = None, max_samples: Optional[float] = None):
-        """Generate a sample from the Hawkes process using Ogata's thinning algorithm.
+    def sample_inverse(
+        self,
+        ts: MVEventData,
+        num_steps: int = 1,
+        rng: Optional[torch.Generator | int] = None,
+        tol: float = 1e-6,
+        max_newton_iters: int = 50,
+    ):
+        """
+        Sample next event by inverting the total (superposed) CDF and then sampling the event type.
+
+        Steps:
+        1. Draw `u ~ Uniform(0,1)` and set `target = -log(1-u)`.
+        2. Invert `C_total(T) = sum_d C_d(T)` to find T* such that C_total(T*) = target using the helpers in `hawkes.utils`.
+        3. Evaluate `lambda_d(T*)` and sample the event type from the categorical distribution with probs proportional to lambda_d(T*).
 
         Args:
-            Tstart: Start time
-            Tend: End time
-            events: Initial events (optional)
-            seed: Random seed
+            ts: past events as `MVEventData`.
+            rng: optional torch.Generator for reproducibility.
+            tol: tolerance passed to the root solver.
+            max_newton_iters: maximum iterations passed to the root solver.
+
+        Returns:
+            (t_star, type_idx)
         """
 
-        # TODO include seeding for reproducibility.
+        # TODO allow drawing more samples.
+        # TODO fix CUDA (prob in whole class). BatchedMVEventData .seq_length and .max_time have cuda problems.
 
-        # Required if the process is potentially unstable (infinite loop)
-        num_samples = 0
+        step = 0
+        time_samples = []
+        dist_samples = []
 
-        if ts is None:
-            events = []
-            event_types = []
-        else:
-            # unpack times and types
-            events = ts.time_points.tolist()
-            event_types = ts.event_types.tolist()
+        if rng is None:
+            rng = torch.Generator()
+        elif isinstance(rng, int):
+            rng = torch.Generator().manual_seed(rng)
 
-        # Generators do not work with torch distributions...
-        # generator = torch.Generator()
+        for step in range(0, num_steps):
+            # Pack single sequence into BatchedMVEventData
+            batched = BatchedMVEventData([ts.time_points], [ts.event_types])
 
-        t = Tstart
+            device = ts.time_points.device
 
-        while t < Tend:
-            lambdas = self.intensity(
-                t,
-                MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)),
-            )
-            lambda_sum = lambdas.sum().item() + 1e-8  # total intensity
-            delta_t = torch.distributions.Exponential(lambda_sum).sample().item()
-            t_proposed = t + delta_t
-            if t_proposed > Tend:
-                break
-            # Get intensity at proposed time
-            lambdas_prop = self.intensity(
-                t_proposed,
-                MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)),
-            )
-            lambda_sum_prop = lambdas_prop.sum().item()
-            if torch.rand(1) <= lambda_sum_prop / lambda_sum:
-                # Accept
-                probs = lambdas_prop / lambda_sum_prop
-                event_type = torch.multinomial(probs, 1).item()
-                events.append(t_proposed)
-                event_types.append(event_type)
-                num_samples += 1
-                if max_samples is not None and num_samples >= max_samples:
-                    break
-            t = t_proposed
-        return MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long))
+            # current time baseline (last observed event time) or 0
+            if len(ts) == 0:
+                t0 = 0.0
+            else:
+                t0 = float(ts.time_points[-1].item())
 
-    def sample_naive(self, Tstart: float, Tend: float, step_size: float, ts: Optional[MVEventData] = None):
-        """Generate a sample from the Hawkes process using a very naive stepping algorithm.
+            # Draw a single uniform for the superposed process
+            u = torch.rand(size=(), generator=rng, device=device).item()
+            target_total = -torch.log1p(-torch.tensor(u)).item()
 
-        Args:
-            Tstart: Start time
-            Tend: End time
-            delta_t: Time step
-            events: Initial events (optional)
-            seed: Random seed
-        """
+            # define scalar-evaluators for the total cumulative and total intensity
+            def ci_total(T_scalar: float, ci_low, ts) -> float:
+                T_tensor = torch.tensor([T_scalar], dtype=ts.time_points.dtype, device=device)
+                ci_vec = (self.cumulative_intensity(T_tensor, batched) - ci_low)[0]  # shape (D,)
+                return float(ci_vec.sum().item())
 
-        if ts is None:
-            events = []
-            event_types = []
-        else:
-            # unpack times and types
-            events = ts.time_points.tolist()
-            event_types = ts.event_types.tolist()
+            def lambda_total(T_scalar: float, ts) -> float:
+                T_tensor = torch.tensor([T_scalar], dtype=ts.time_points.dtype, device=device)
+                lam_vec = self.intensity(T_tensor, batched)[0]  # shape (D,)
+                return float(lam_vec.sum().item())
 
-        t = Tstart
+            low = float(t0)
+            ci_low = self.cumulative_intensity(torch.tensor([low], dtype=ts.time_points.dtype, device=device), batched)
 
-        while t < Tend:
-            lambdas = self.intensity(
-                t,
-                MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long)),
-            )
-            # We approximate the intensities as locally constant. Then we can treat them all as if they were
-            # exponentially distributed in a very small time window [t,t+delta_t]
+            # bracket the root
+            ci_kwargs = {"ci_low": ci_low, "ts": batched}
+            lambda_kwargs = {"ts": batched}
+            low, high, ci_low, ci_high = bracket_monotone(ci_total, float(t0), target_total, func_kwargs=ci_kwargs)
 
-            # We sample all exponentials at the same time, through batching.
-            samples = torch.distributions.Exponential(lambdas).sample((1,))[0]
+            if ci_high < target_total:
+                # failed to bracket: return high and sample type at high
+                t_star = float(high)
+            else:
+                # invert using safeguarded Newton
+                t_star = invert_monotone_newton(
+                    ci_total,
+                    lambda_total,
+                    target_total,
+                    low,
+                    high,
+                    tol=tol,
+                    max_iters=max_newton_iters,
+                    mono_kwargs=ci_kwargs,
+                    d_kwargs=lambda_kwargs,
+                )
 
-            # These samples are only "valid" for a very small time-windows (as the intensities are not constant but decreasing).
-            accepted_samples = samples <= step_size
-            accepted_event_types = torch.arange(len(lambdas))[accepted_samples]
-            accepted_event_times = t + samples[accepted_samples]
+            # Compute per-type intensities at t_star and sample type
+            T_tensor = torch.tensor([t_star], dtype=ts.time_points.dtype, device=device)
+            lam_vec = self.intensity(T_tensor, batched)[0]  # shape (D,)
+            lam_sum = float(lam_vec.sum().item())
 
-            sort_idcs = torch.argsort(accepted_event_times)
+            D = lam_vec.shape[0]
+            if lam_sum <= 1e-12 or not (lam_sum == lam_sum):
+                # Degenerate: no intensity; choose uniformly
+                type_idx = int(torch.randint(high=D, size=(1,), generator=rng).item())
+            else:
+                probs = lam_vec / lam_sum
+                # torch.multinomial expects 2D or 1D float tensor
+                type_idx = torch.multinomial(probs, num_samples=1, generator=rng)
 
-            accepted_event_times = accepted_event_times[sort_idcs]
-            accepted_event_types = accepted_event_types[sort_idcs]
+            time_samples.append(t_star)
+            dist_samples.append(probs)
 
-            for t, e in zip(accepted_event_times, accepted_event_types):
-                events.append(t.item())
-                event_types.append(e.item())
+            new_time_points = torch.cat([ts.time_points, T_tensor], dim=0)
+            new_event_types = torch.cat([ts.event_types, type_idx], dim=0)
 
-        return MVEventData(time_points=torch.tensor(events), event_types=torch.tensor(event_types, dtype=torch.long))
+            ts = MVEventData(new_time_points, new_event_types)
+
+        return ts, time_samples, dist_samples
+
+
+# %%
