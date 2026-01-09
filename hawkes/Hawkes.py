@@ -145,7 +145,7 @@ class AbstractHawkesProcess(torch.nn.Module):
 class ExpKernelMVHawkesProcess(torch.nn.Module):
     def __init__(
         self,
-        params: Optional[ExpKernelParams],
+        params: Optional[ExpKernelParams] = None,
         D: Optional[int] = None,
         seed: Optional[int] = 42,
         integration_mode: Literal["trapezoidal", "monte_carlo", "mc_trapezoidal"] = "trapezoidal",
@@ -338,7 +338,7 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         # TODO changed here from the previous version, where lambda(t,k)*exp(-ci(t,k)) to lambda(t,k)*exp(-sum_k (ci(t,k)))
         intensities = self.intensity(T, ts)  # Shape: (B,D)
         ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B,D)
-        pdfs = intensities * torch.exp(-torch.sum(ci, dim=1))  # Shape: (B,)
+        pdfs = intensities * torch.exp(-torch.sum(ci, dim=1)).unsqueeze(1)  # Shape: (B,)
         return pdfs
 
     def CDF(self, T: torch.Tensor, ts: BatchedMVEventData):
