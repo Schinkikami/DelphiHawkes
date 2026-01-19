@@ -3,10 +3,11 @@ from pathlib import Path
 from typing import Optional
 import torch
 from tqdm import tqdm
-from .hawkes.Hawkes import ExpKernelMVHawkesProcess
 from torch.utils.data import DataLoader
-from .event_utils import MVEventData, BatchedMVEventData
-from .ukb_loading import load_ukb_sequences
+
+from hawkes.baseline import ConditionalInhomogeniousPoissonProcess
+from hawkes.event_utils import MVEventData, BatchedMVEventData
+from hawkes.ukb_loading import load_ukb_sequences
 # %%
 
 
@@ -30,7 +31,7 @@ def measure_likelihood(model, dataloader, device):
 
 
 def batched_train_loop(
-    model: ExpKernelMVHawkesProcess,
+    model: ConditionalInhomogeniousPoissonProcess,
     events_batch: DataLoader,
     test_events: Optional[DataLoader] = None,
     num_steps=100,
@@ -42,6 +43,8 @@ def batched_train_loop(
     model = model.to(device=device)
     optim = torch.optim.AdamW(model.parameters(), lr=step_size, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optim, step_size=200, gamma=0.1)
+
+    torch.autograd.set_detect_anomaly(True)
 
     likelihoods = []
     test_likelihoods = []
@@ -66,13 +69,17 @@ def batched_train_loop(
             ll = torch.mean(ll)
             nll = -ll
             nll.backward()
+
+            # Training stabilization
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1000)
+            # for param in model.parameters():
+            #    if param.grad is not None:
+            #        torch.nan_to_num_(param.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
+
             last_ll = ll.item()
             likelihoods.append(ll.item())
             optim.step()
             scheduler.step()
-
-            # with torch.no_grad():
-            #    model.ensure_stability()
 
             if test_events is not None and (step % eval_freq == 0 or step == num_steps - 1):
                 with torch.no_grad():
@@ -108,12 +115,11 @@ def batched_train_loop(
 
 
 # %%
-
 # Load UKB data
 LIMIT_DATSET_SIZE = None
 step_size = 1e-0
 NUM_STEPS = 1000
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("cpu")
 
 BATCH_SIZE = 512
 
@@ -193,17 +199,15 @@ N = len(sequences)  # Number of time-series
 load_path = None
 if load_path is not None and load_path.exists():
     print("Loading pre-trained model...")
-    loaded_model = ExpKernelMVHawkesProcess(None, D)
+    loaded_model = ConditionalInhomogeniousPoissonProcess(None, D)
     loaded_model.load_state_dict(torch.load(str(load_path)))
-    real_MVHP = loaded_model
+    poisson_process = loaded_model
 else:
-    real_MVHP = ExpKernelMVHawkesProcess(None, D, seed=43)
-
-real_MVHP = real_MVHP
+    poisson_process = ConditionalInhomogeniousPoissonProcess(None, D, seed=43)
 # %%
 
-init_ll_train = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_train, device=DEVICE))
-init_ll_val = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_val, device=DEVICE))
+init_ll_train = torch.mean(measure_likelihood(model=poisson_process, dataloader=dataloader_train, device=DEVICE))
+init_ll_val = torch.mean(measure_likelihood(model=poisson_process, dataloader=dataloader_val, device=DEVICE))
 # init_ll_test = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_test, device=DEVICE))
 
 print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train}")
@@ -218,9 +222,9 @@ print(f"Will train {num_epochs_training} epochs!")
 # %%
 # Run a short training for evaluation purposes
 # Run a short training for evaluation purposes
-save_path = ROOT / "models" / "hawkes_trained.pth"
+save_path = ROOT / "models" / "cond_inh_poisson_trained.pth"
 fit_model, train_lls, val_lls = batched_train_loop(
-    real_MVHP,
+    poisson_process,
     dataloader_train,
     dataloader_val,
     num_steps=NUM_STEPS,

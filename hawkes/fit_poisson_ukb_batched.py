@@ -3,10 +3,10 @@ from pathlib import Path
 from typing import Optional
 import torch
 from tqdm import tqdm
-from .hawkes.Hawkes import ExpKernelMVHawkesProcess
+from hawkes.baseline import PoissonProcess
 from torch.utils.data import DataLoader
-from .event_utils import MVEventData, BatchedMVEventData
-from .ukb_loading import load_ukb_sequences
+from hawkes.event_utils import MVEventData, BatchedMVEventData
+from hawkes.ukb_loading import load_ukb_sequences
 # %%
 
 
@@ -30,7 +30,7 @@ def measure_likelihood(model, dataloader, device):
 
 
 def batched_train_loop(
-    model: ExpKernelMVHawkesProcess,
+    model: PoissonProcess,
     events_batch: DataLoader,
     test_events: Optional[DataLoader] = None,
     num_steps=100,
@@ -193,17 +193,16 @@ N = len(sequences)  # Number of time-series
 load_path = None
 if load_path is not None and load_path.exists():
     print("Loading pre-trained model...")
-    loaded_model = ExpKernelMVHawkesProcess(None, D)
+    loaded_model = PoissonProcess(None, D)
     loaded_model.load_state_dict(torch.load(str(load_path)))
-    real_MVHP = loaded_model
+    poisson_process = loaded_model
 else:
-    real_MVHP = ExpKernelMVHawkesProcess(None, D, seed=43)
+    poisson_process = PoissonProcess(None, D, seed=43)
 
-real_MVHP = real_MVHP
 # %%
 
-init_ll_train = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_train, device=DEVICE))
-init_ll_val = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_val, device=DEVICE))
+init_ll_train = torch.mean(measure_likelihood(model=poisson_process, dataloader=dataloader_train, device=DEVICE))
+init_ll_val = torch.mean(measure_likelihood(model=poisson_process, dataloader=dataloader_val, device=DEVICE))
 # init_ll_test = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_test, device=DEVICE))
 
 print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train}")
@@ -218,9 +217,9 @@ print(f"Will train {num_epochs_training} epochs!")
 # %%
 # Run a short training for evaluation purposes
 # Run a short training for evaluation purposes
-save_path = ROOT / "models" / "hawkes_trained.pth"
+save_path = ROOT / "models" / "poisson_trained.pth"
 fit_model, train_lls, val_lls = batched_train_loop(
-    real_MVHP,
+    poisson_process,
     dataloader_train,
     dataloader_val,
     num_steps=NUM_STEPS,
