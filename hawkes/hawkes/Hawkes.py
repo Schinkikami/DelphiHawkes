@@ -26,122 +26,6 @@ class ExpKernelParams:
     beta: torch.Tensor
 
 
-class AbstractHawkesProcess(torch.nn.Module):
-    def __init__(
-        self,
-        D: Optional[int] = None,
-        seed: Optional[int] = 42,
-        integration_mode: Literal["trapezoidal", "monte_carlo", "mc_trapezoidal"] = "trapezoidal",
-    ) -> None:
-        self.D = D
-        self.seed = seed
-        self.integration_mode = integration_mode
-
-        super().__init__()
-
-    def kernel(self, delta_t: float, type_1: int, type_2: int):
-        raise NotImplementedError()
-
-    def intensity(self, t: float | torch.Tensor, ts: MVEventData | list[MVEventData]):
-        raise NotImplementedError("Overwrite this function to implement a kernel.")
-
-    def intensity_integral(self, T: float | torch.Tensor, ts: MVEventData | list[MVEventData]):
-        raise NotImplementedError("Optional.")
-
-    def get_parameters(self):
-        raise NotImplementedError("Implement: Return the true parameters of the kernel.")
-
-    def _enocde_parameters(self):
-        raise NotImplementedError()
-
-    def likelihood(self, T: float, ts: MVEventData | list[MVEventData], log: bool = True):
-        raise NotImplementedError()
-
-    def sample(self, T, ts: MVEventData):
-        raise NotImplementedError()
-
-    def integral_numerical(self, T: float, ts: MVEventData, num_integration_points: int = 1000):
-        # Currently not used as we use the exponential kernel.
-        # However, good for comparing performance for later kernels.
-
-        if self.INTEGRATION_MODE == "trapezoidal":
-            evaluation_points = torch.linspace(0, T, num_integration_points)
-
-            ## Find the indices of events to include at each evaluation point
-            ## Vectorized PyTorch implementation
-            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
-            ## Old loop-based implementation
-            # included_events_idcs = torch.zeros_like(evaluation_points, dtype=torch.long)
-            # curr_idx = 0
-            # for i,t in enumerate(evaluation_points):
-            #    #Only include events before time t
-            #    while curr_idx < len(ts) and ts.time_points[curr_idx] < t:
-            #        curr_idx += 1
-            #    included_events_idcs[i] = curr_idx
-
-            ## Compute intensity values at each evaluation point
-            ## Fast implementation.
-            intensity_values = torch.stack(
-                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
-            )  # Shape: (num_integration_points, D)
-            integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
-
-            ## Old loop-based implementation
-            # for i, t in enumerate(evaluation_points):
-            #    #Only include events before time t
-            #    while included_events_idx < len(ts) and ts.time_points[included_events_idx] < t:
-            #        included_events_idx += 1
-            #    relevant_events = ts[:included_events_idx]
-            #    intensity_values[i] = self.intensity( t, relevant_events)
-            # integral = _trapz(intensity_values, evaluation_points)
-
-            return integral
-
-        elif self.INTEGRATION_MODE == "monte_carlo":
-            # Monte-Carlo integration
-            # Should not be used (high variance and unoptimized implementation)
-            # Raise warning on first use that it is not recommended.
-            if not hasattr(self, "_mc_warning_issued"):
-                print(
-                    "Warning: Monte Carlo integration mode is not recommended due to high variance and unoptimized implementation."
-                )
-                self._mc_warning_issued = True
-
-            rng = torch.Generator()
-
-            evaluation_points = T * torch.rand(size=(num_integration_points,), generator=rng)
-            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
-            intensity_values = torch.stack(
-                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
-            )  # Shape: (num_integration_points, D)
-
-            integral = (T / num_integration_points) * torch.sum(intensity_values)
-
-            return integral
-
-        elif self.INTEGRATION_MODE == "mc_trapezoidal":
-            # Hybrid Monte-Carlo + Trapezoidal integration
-            # Trapezoidal integration on random evaluation points. Beginning and end points are always included.
-
-            rng = torch.Generator()
-
-            evaluation_points = T * torch.rand(size=(num_integration_points - 2,), generator=rng)
-            evaluation_points = torch.cat([torch.tensor([0.0]), evaluation_points, torch.tensor([T])])
-            evaluation_points, _ = torch.sort(evaluation_points)
-
-            included_events_idcs = torch.searchsorted(ts.time_points, evaluation_points, right=False)
-            intensity_values = torch.stack(
-                [self.intensity(t, ts[:ie_idx]) for t, ie_idx in zip(evaluation_points, included_events_idcs)]
-            )  # Shape: (num_integration_points, D)
-
-            integral = torch.trapezoid(intensity_values, evaluation_points, dim=0)  # Shape: (D,)
-
-            return integral
-
-        else:
-            raise ValueError(f"Unknown INTEGRATION_MODE {self.INTEGRATION_MODE}")
-
-
 class ExpKernelMVHawkesProcess(torch.nn.Module):
     def __init__(
         self,
@@ -301,9 +185,13 @@ class ExpKernelMVHawkesProcess(torch.nn.Module):
         """
 
         valid_mask = ts.event_types != -1  # Shape: (B,N)
+        future_event_mask = ts.time_points >= T.unsqueeze(1)  # Shape: (B,N)
 
-        # TODO if T <= ts.time_points.max(), we include future events with a negative effect.
-        # This is definitly a bug.
+        valid_mask = valid_mask & ~future_event_mask
+
+        # DONE if T <= ts.time_points.max(), we include future events with a negative effect.
+        # This is definitly a bug. Should be fixed now...
+
         # TODO  Probably should also include a lower bound, so that I can always compute the integral from low to T.
         # assert (
         #    T >= torch.where(valid_mask, ts.time_points.clone(), torch.zeros_like(ts.time_points)).max(dim=1)[0]

@@ -5,13 +5,19 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from hawkes.baseline import SplinePoissonProcess
 from hawkes.event_utils import MVEventData, BatchedMVEventData
+from hawkes.tpps import TemporalPointProcess
+from hawkes.baseline_tpps import (
+    PoissonProcess,
+    ConditionalInhomogeniousPoissonProcess,
+    SplinePoissonProcess,
+)
+from hawkes.Hawkes_TPP import ExpKernelMVHawkesProcess
 from hawkes.ukb_loading import load_ukb_sequences
 # %%
 
 
-def measure_likelihood(model, dataloader, device):
+def measure_likelihood(model: TemporalPointProcess, dataloader: DataLoader, device):
     model = model.to(device)
 
     lls = []
@@ -31,7 +37,7 @@ def measure_likelihood(model, dataloader, device):
 
 
 def batched_train_loop(
-    model: SplinePoissonProcess,
+    model: TemporalPointProcess,
     events_batch: DataLoader,
     test_events: Optional[DataLoader] = None,
     num_steps=100,
@@ -69,12 +75,6 @@ def batched_train_loop(
             ll = torch.mean(ll)
             nll = -ll
             nll.backward()
-
-            # Training stabilization
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1000)
-            # for param in model.parameters():
-            #    if param.grad is not None:
-            #        torch.nan_to_num_(param.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
 
             last_ll = ll.item()
             likelihoods.append(ll.item())
@@ -116,16 +116,26 @@ def batched_train_loop(
 
 # %%
 # Load UKB data
-LIMIT_DATSET_SIZE = 100000
+LIMIT_DATSET_SIZE = 10000
 step_size = 1e-0
-NUM_STEPS = 1000
-DEVICE = torch.device("cpu")
+NUM_STEPS = 300
+DEVICE = torch.device("cuda:0")
 
 BATCH_SIZE = 512
 
 TEST_RATIO = 0.20
 VALIDATION_RATIO = 0.10
 # -> TRAIN_RATIO = 0.70
+
+# Model selection
+# Options: "poisson", "inhomogeneous_poisson", "spline_poisson", "hawkes"
+MODEL_TYPE = "spline_poisson"
+
+# Model-specific hyperparameters
+
+# Spline
+K = 5  # Number of knots for spline-based models
+delta_t = 1.5 / K  # Time spacing for splines
 
 
 # Make file paths relative to repository root for robust execution
@@ -191,25 +201,65 @@ dataloader_val = DataLoader(dataset=dataset_val, batch_size=BATCH_SIZE, shuffle=
 
 # %%
 
+# Determine model type and instantiate the appropriate model
+
 D = int(num_event_types)  # Number of event types
-K = 20  # Number of spline knots
-delta_t = 1.5 / K
 sequence_length = torch.tensor([ts.time_points[-1] for ts in sequences])
 T = sequence_length + (1 / 365)
 N = len(sequences)  # Number of time-series
 
+
 load_path = None
-if load_path is not None and load_path.exists():
-    print("Loading pre-trained model...")
-    loaded_model = SplinePoissonProcess(D, K, delta_t)
-    loaded_model.load_state_dict(torch.load(str(load_path)))
-    poisson_process = loaded_model
+
+# Model factory
+if MODEL_TYPE == "poisson":
+    print("Creating Poisson Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = PoissonProcess(D=D, seed=43)
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = PoissonProcess(D=D, seed=43)
+    save_filename = "poisson.pth"
+
+elif MODEL_TYPE == "inhomogeneous_poisson":
+    print("Creating Inhomogeneous Poisson Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = ConditionalInhomogeniousPoissonProcess(D=D, seed=43)
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = ConditionalInhomogeniousPoissonProcess(D=D, seed=43)
+    save_filename = "inhomogeneous_poisson.pth"
+
+elif MODEL_TYPE == "spline_poisson":
+    print("Creating Spline Poisson Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = SplinePoissonProcess(D, K, delta_t)
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = SplinePoissonProcess(D, K, delta_t, seed=43)
+    save_filename = "splinepp.pth"
+
+elif MODEL_TYPE == "hawkes":
+    print("Creating Exponential Kernel Hawkes Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = ExpKernelMVHawkesProcess(D=D, seed=43)
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = ExpKernelMVHawkesProcess(D=D, seed=43)
+    save_filename = "hawkes.pth"
+
 else:
-    poisson_process = SplinePoissonProcess(D, K, delta_t, seed=43)
+    raise ValueError(
+        f"Unknown model type: {MODEL_TYPE}. Choose from: poisson, inhomogeneous_poisson, spline_poisson, hawkes"
+    )
 # %%
 
-init_ll_train = torch.mean(measure_likelihood(model=poisson_process, dataloader=dataloader_train, device=DEVICE))
-init_ll_val = torch.mean(measure_likelihood(model=poisson_process, dataloader=dataloader_val, device=DEVICE))
+init_ll_train = torch.mean(measure_likelihood(model=model, dataloader=dataloader_train, device=DEVICE))
+init_ll_val = torch.mean(measure_likelihood(model=model, dataloader=dataloader_val, device=DEVICE))
 # init_ll_test = torch.mean(measure_likelihood(model=real_MVHP, dataloader=dataloader_test, device=DEVICE))
 
 print(f"Baseline log-likelihood of init model on train dataset: {init_ll_train}")
@@ -223,10 +273,9 @@ print(f"Will train {num_epochs_training} epochs!")
 
 # %%
 # Run a short training for evaluation purposes
-# Run a short training for evaluation purposes
-save_path = ROOT / "models" / "splinepp.pth"
+save_path = ROOT / "models" / f"new_{save_filename}"
 fit_model, train_lls, val_lls = batched_train_loop(
-    poisson_process,
+    model,
     dataloader_train,
     dataloader_val,
     num_steps=NUM_STEPS,

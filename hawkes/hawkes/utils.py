@@ -1,5 +1,14 @@
+from collections.abc import Callable
+from typing import Optional, Tuple
 import torch
 from torch import Tensor
+
+from .event_utils import BatchedMVEventData
+
+
+# ==============================================================================
+# Function Utilities
+# ==============================================================================
 
 
 def inverse_softplus(x: Tensor):
@@ -9,11 +18,144 @@ def inverse_softplus(x: Tensor):
     return torch.log(torch.expm1(x))
 
 
+# ==============================================================================
+# Numerical Integration Utilities
+# ==============================================================================
+
+
+def trapezoidal_integration(
+    intensity_func: Callable,
+    t_start: torch.Tensor,
+    t_end: torch.Tensor,
+    ts: BatchedMVEventData,
+    num_points: int = 100,
+) -> torch.Tensor:
+    """
+    Compute integral using trapezoidal rule.
+
+    Args:
+        func: Function to integrate, should accept (t: Tensor, ts: BatchedMVEventData) -> Tensor of shape (B, D)
+        t_start: Start times. Shape: (B,)
+        t_end: End times. Shape: (B,)
+        ts: Batched event data
+        num_points: Number of integration points
+
+    Returns:
+        Integral values. Shape: (B, D)
+    """
+
+    device = t_start.device
+
+    t_vals = torch.linspace(0, 1, num_points, device=device)
+    t_vals = t_start.unsqueeze(1) + (t_end - t_start).unsqueeze(1) * t_vals.unsqueeze(0)  # (B, num_points)
+
+    intensities = [
+        intensity_func(t=t_vals[:, k], ts=ts) for k in range(num_points)
+    ]  # List of length num_points, each (B,D)
+    intensities = torch.stack(intensities, dim=2)  # Shape: (B, D, num_points)
+
+    # Trapezoidal rule
+    integrals = torch.trapezoid(intensities, t_vals.unsqueeze(1), dim=2)  # Shape: (B, D)
+
+    return integrals
+
+
+def monte_carlo_trapezoidal_integration(
+    intensity_func: Callable,
+    t_start: torch.Tensor,
+    t_end: torch.Tensor,
+    ts: BatchedMVEventData,
+    num_points: int = 100,
+    rng: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Hybrid Monte Carlo + Trapezoidal integration.
+
+    Places evaluation points randomly in [t_start, t_end] while including boundaries,
+    then uses trapezoidal rule on the sorted points.
+
+    Args:
+        func: Function to integrate
+        t_start: Start times. Shape: (B,)
+        t_end: End times. Shape: (B,)
+        ts: Batched event data
+        num_points: Number of integration points
+        rng: Random number generator
+
+    Returns:
+        Integral values. Shape: (B, D)
+    """
+    if rng is None:
+        rng = torch.Generator()
+
+    B = ts.shape[0]
+
+    device = t_start.device
+
+    random_points = (t_end - t_start).unsqueeze(1) * torch.rand(
+        (B, num_points - 2), generator=rng, device=device
+    ) + t_start.unsqueeze(1)  # (B, num_points-2)
+
+    t_vals = torch.cat(
+        [torch.tensor([t_start], device=device), random_points, torch.tensor([t_end], device=device)], dim=1
+    )  # (B, num_points)
+
+    # Sort
+    t_vals, _ = torch.sort(t_vals, dim=1)
+
+    intensities = [
+        intensity_func(t=t_vals[:, k], ts=ts) for k in range(num_points)
+    ]  # List of length num_points, each (B,D)
+    intensities = torch.stack(intensities, dim=2)  # Shape: (B, D, num_points)
+
+    # Trapezoidal rule
+    integrals = torch.trapezoid(intensities, t_vals.unsqueeze(1), dim=2)  # Shape: (B, D)
+
+    return integrals
+
+
+def numerical_integration(
+    func: Callable,
+    t_start: torch.Tensor,
+    t_end: torch.Tensor,
+    ts: BatchedMVEventData,
+    method: str = "trapezoidal",
+    num_points: int = 100,
+    rng: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Numerically integrate a function using the specified method.
+
+    Args:
+        func: Function to integrate, should accept (t: Tensor, ts: BatchedMVEventData) -> Tensor of shape (B, D)
+        t_start: Start times. Shape: (B,)
+        t_end: End times. Shape: (B,)
+        ts: Batched event data
+        method: One of "trapezoidal", "mc_trapezoidal"
+        num_points: Number of integration points
+        rng: Random number generator (required for MC methods)
+
+    Returns:
+        Integral values. Shape: (B, D)
+    """
+    if method == "trapezoidal":
+        return trapezoidal_integration(func, t_start, t_end, ts, num_points)
+    elif method == "mc_trapezoidal":
+        return monte_carlo_trapezoidal_integration(func, t_start, t_end, ts, num_points, rng)
+    else:
+        raise ValueError(f"Unknown integration method: {method}")
+
+
+# ==============================================================================
+# Monotone Function Inversion Utilities
+# ==============================================================================
+
+
 def bracket_monotone(
     monot_func,
-    low: float,
-    target: float,
-    initial_high: float | None = None,
+    low: torch.Tensor,
+    target: torch.Tensor,
+    initial_high: torch.Tensor | None = None,
     expand_factor: float = 2.0,
     max_expands: int = 60,
     func_kwargs: dict = dict(),
@@ -58,14 +200,14 @@ def bracket_monotone(
 def invert_monotone_newton(
     monot_func,
     d_func,
-    target: float,
-    low: float,
-    high: float,
+    target: torch.Tensor,
+    low: torch.Tensor,
+    high: torch.Tensor,
     tol: float = 1e-6,
     max_iters: int = 50,
     mono_kwargs: dict = dict(),
     d_kwargs: dict = dict(),
-):
+) -> Tensor:
     """
     Invert a monotone cumulative function ci_func(T) to find T such that ci_func(T) = target.
 
@@ -114,3 +256,57 @@ def invert_monotone_newton(
         T = T_new
 
     return T
+
+
+def invert_CI(
+    cumulative_intensity_func: Callable[[torch.Tensor], torch.Tensor],
+    intensity_func: Callable[[torch.Tensor], torch.Tensor],
+    target: torch.Tensor,
+    bracket_init: Tuple[torch.Tensor, torch.Tensor],
+    tol: float = 1e-6,
+    max_newton_iters: int = 50,
+    expand_factor: float = 2.0,
+    max_expansions: int = 100,
+) -> torch.Tensor:
+    """
+    Invert cumulative intensity using Newton's method with bracketing.
+
+    Args:
+        cumulative_intensity_func: Callable that returns cumulative intensity at time t (thats absolute time)
+        intensity_func: Callable that returns intensity (derivative of CDF) at time t (thats absolute time)
+        target: Target cumulative intensity value to invert
+        bracket_init: Initial bracket interval
+        tol: Tolerance for convergence
+        max_newton_iters: Maximum Newton iterations
+        expand_factor: Factor to expand bracket by
+        max_expansions: Maximum bracket expansion iterations
+
+    Returns:
+        Time t such that cumulative_intensity_func(t) ≈ target
+    """
+    # First, bracket the root
+    low, high, ci_low, ci_high = bracket_monotone(
+        cumulative_intensity_func,
+        bracket_init[0],
+        target,
+        initial_high=bracket_init[1],
+        expand_factor=expand_factor,
+        max_expands=max_expansions,
+    )
+
+    # if ci_high < target:
+    #    # Failed to bracket: return high value
+    #    return float(high)
+
+    # Use Newton's method with bisection fallback
+    t_star = invert_monotone_newton(
+        cumulative_intensity_func,
+        intensity_func,
+        target,
+        low,
+        high,
+        tol=tol,
+        max_iters=max_newton_iters,
+    )
+
+    return t_star

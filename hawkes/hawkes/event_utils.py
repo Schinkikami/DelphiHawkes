@@ -82,7 +82,7 @@ class BatchedMVEventData(TensorDict):
     ):
         assert (time_points is not None and event_types is not None) or (mv_events is not None)
 
-        if mv_events:
+        if mv_events is not None:
             assert isinstance(mv_events, list)
             sort = False
             time_points = [ts.time_points for ts in mv_events]
@@ -101,10 +101,10 @@ class BatchedMVEventData(TensorDict):
                 assert e.dim() == 1
                 assert t.shape == e.shape
 
-            # Assert time_points have float type
-            assert time_points[0].dtype.is_floating_point
-            # Assert event_types have integer type
-            assert not event_types[0].dtype.is_floating_point
+            # Assert time_points have float type and event_types have integer type (if not empty)
+            if batch_size > 0:
+                assert time_points[0].dtype.is_floating_point
+                assert not event_types[0].dtype.is_floating_point
 
         if sort:
             for i in range(len(time_points)):
@@ -113,20 +113,45 @@ class BatchedMVEventData(TensorDict):
                 event_types[i] = event_types[i][sorted_indices]
 
         lengths = [len(b) for b in time_points]
-        length = max(lengths)
-        device = time_points[0].device
-        dtype_time = time_points[0].dtype
-        dtype_event = event_types[0].dtype
+        length = max(lengths) if lengths else 0
 
-        max_time = torch.max(torch.tensor([tp[-1].max() for tp in time_points])) + self.MAX_TIME_OFFSET
+        # Determine device and dtypes
+        if batch_size > 0:
+            device = time_points[0].device
+            dtype_time = time_points[0].dtype
+            dtype_event = event_types[0].dtype
+        else:
+            # For empty batch, use default dtypes and CPU device
+            device = torch.device("cpu")
+            dtype_time = torch.float32
+            dtype_event = torch.long
 
-        padded_time_points = torch.full((batch_size, length), max_time, dtype=dtype_time, device=device)
-        padded_event_types = torch.full((batch_size, length), -1, dtype=dtype_event, device=device)
+        # Handle completely empty batch
+        if batch_size == 0:
+            # Create empty tensors with determined dtypes and device
+            padded_time_points = torch.empty((0, 0), dtype=dtype_time, device=device)
+            padded_event_types = torch.empty((0, 0), dtype=dtype_event, device=device)
+        else:
+            # Calculate max_time, handling empty sequences
+            # Find the maximum time across all non-empty sequences to use as padding value
+            non_empty_last_times = [tp[-1] for tp in time_points if len(tp) > 0]
 
-        for i, (t, e) in enumerate(zip(time_points, event_types)):
-            n = len(t)
-            padded_time_points[i, :n] = t
-            padded_event_types[i, :n] = e
+            if non_empty_last_times:
+                max_time = torch.tensor(non_empty_last_times).max() + self.MAX_TIME_OFFSET
+            else:
+                # All sequences are empty - use just the offset
+                max_time = torch.tensor(0, dtype=dtype_time, device=device)
+
+            # Initialize padded tensors with padding values
+            # max_time is used for padding time_points (so empty sequences get this value)
+            # -1 is used for padding event_types
+            padded_time_points = torch.full((batch_size, length), max_time, dtype=dtype_time, device=device)
+            padded_event_types = torch.full((batch_size, length), -1, dtype=dtype_event, device=device)
+
+            for i, (t, e) in enumerate(zip(time_points, event_types)):
+                n = len(t)
+                padded_time_points[i, :n] = t
+                padded_event_types[i, :n] = e
 
         self.seq_lengths = lengths
 
@@ -145,7 +170,20 @@ class BatchedMVEventData(TensorDict):
     @property
     def max_time(self):
         """Returns the time of the last event per sequence."""
-        return self.time_points[torch.arange(0, len(self.seq_lengths)), torch.tensor(self.seq_lengths) - 1]
+        if len(self.seq_lengths) == 0:
+            return torch.empty(0, dtype=self.time_points.dtype, device=self.time_points.device)
+
+        # Handle sequences with mixed lengths, including empty sequences (length 0)
+        seq_lengths_tensor = torch.tensor(self.seq_lengths, device=self.time_points.device)
+        batch_indices = torch.arange(len(self.seq_lengths), device=self.time_points.device)
+
+        # For sequences with length > 0, get the last time_point; for length 0, use 0.0 as placeholder
+        # Note: Empty sequences (length 0) will have their max_time set to the padding value from time_points
+        last_indices = torch.where(seq_lengths_tensor > 0, seq_lengths_tensor - 1, 0)
+        max_times = self.time_points[batch_indices, last_indices]
+
+        # For empty sequences, the max_time is actually undefined, we return 0
+        return max_times
 
     def to(self, device):
         """Override to() to preserve seq_lengths attribute when moving to device."""
@@ -164,6 +202,23 @@ class BatchedMVEventData(TensorDict):
         result = super().cpu()
         result.seq_lengths = self.seq_lengths
         return result
+
+    def get_unpadded_sequences(self) -> list[MVEventData]:
+        """
+        Returns a list of unpadded MVEventData sequences.
+
+        Returns:
+            List of MVEventData objects containing only the actual events (no padding).
+        """
+        unpadded = []
+        for i in range(len(self.seq_lengths)):
+            seq_len = self.seq_lengths[i]
+            unpadded.append(
+                MVEventData(
+                    time_points=self.time_points[i, :seq_len].clone(), event_types=self.event_types[i, :seq_len].clone()
+                )
+            )
+        return unpadded
 
     def __iter__(self):
         # Iteration yields a batch entry for each event
