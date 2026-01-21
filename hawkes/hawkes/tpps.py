@@ -271,6 +271,8 @@ class TemporalPointProcess(nn.Module, ABC):
         This corresponds to the "data fit" term in the likelihood, measuring how well
         the model predicts the observed events.
 
+        Can be overwritten to provide a far more efficient implementation that only computes the likelihood of the "correct" classes at each time-point.
+
         Args:
             ts: Observed event sequences (batched, padded). Shape: (batch_size, seq_len)
             log: If True, return log-likelihood; otherwise return likelihood

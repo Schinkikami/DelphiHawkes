@@ -2,7 +2,7 @@ from collections.abc import Callable
 from typing import Optional, Tuple
 import torch
 from torch import Tensor
-
+import torch.nn.functional as F
 from .event_utils import BatchedMVEventData
 
 
@@ -16,6 +16,166 @@ def inverse_softplus(x: Tensor):
     # using the numerically stable log(expm1(x)) implementation
     # (sadly torch does not provide logexpm1)
     return torch.log(torch.expm1(x))
+
+
+class LinearSpline(torch.nn.Module):
+    @staticmethod
+    def interpolate(x_knots: torch.Tensor, y_knots: torch.Tensor, t: torch.Tensor):
+        """Interpolates the splines at the given positions.
+
+        Args:
+            x_knots (torch.Tensor): Position of the splines. Shared between all splines. Shape: (K,)
+            y_knots (torch.Tensor): Height of the splines for each knot in each spline. Shape: (D,K)
+            t (torch.Tensor): Time-points where to interpolate the splines. Shape: (B,)
+
+        Returns:
+            interpolation (torch.Tensor): Interpolated splines at t. Shape: (B,D)
+        """
+        k, delta = LinearSpline._get_knot_info(x_knots, t)  # k: (B,), delta: (B,)
+
+        h_k = y_knots[:, k]  # (D,B)
+
+        delta_times = x_knots[1:] - x_knots[:-1]  # (K-1)
+        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (K-1)
+        slopes = delta_heights / delta_times  # (D, K-1)
+        segment_slopes = F.pad(slopes, (0, 1), value=0.0)  # (D, K)
+
+        slope_k = segment_slopes[:, k]  # (D,B)
+
+        interpolation = h_k + slope_k * delta.unsqueeze(0)  # (D,B)
+
+        return interpolation.T  # (B,D)
+
+    @staticmethod
+    def integrate(x_knots: torch.Tensor, y_knots: torch.Tensor, t: torch.Tensor):
+        """Calculates the integral of the splines at the given positions.
+
+        Args:
+            x_knots (torch.Tensor): Position of the splines. Shared between all splines. Shape: (K,)
+            y_knots (torch.Tensor): Height of the splines for each spline and each knot. Shape: (D,K)
+            t (torch.Tensor): Time-points where up to where to integrate the splines (starting from 0). Shape: (B,)
+
+        Returns:
+            integral: (torch.Tensor): Integrated splines up to t. Shape: (B,D)
+        """
+        k, delta = LinearSpline._get_knot_info(x_knots=x_knots, t=t)  # (B,), (B,)
+
+        delta_times = x_knots[1:] - x_knots[:-1]  # (K-1)
+        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (K-1)
+        slopes = delta_heights / delta_times  # (D, K-1)
+
+        segment_areas = (
+            y_knots[:, :-1] * delta_times + slopes / 2.0 * delta_times.unsqueeze(0) ** 2
+        )  # integral_0^t ( h + slope * s)  ds, Shape: (D,K-1)
+
+        prefix_sums = torch.cumsum(segment_areas, dim=1)  # Shape: (D,K-1)
+        prefix_sums = F.pad(prefix_sums, (1, 0), value=0.0)  # (D, K)
+        segment_slopes = F.pad(slopes, (0, 1), value=0.0)  # (D, K)
+
+        # Extract info for current interval
+        C_k = prefix_sums[:, k]  # (D,B)
+        s_k = segment_slopes[:, k]  # (D,B)
+        h_k = y_knots[:, k]  # (D,B)
+        last_knot_loc = x_knots[k]  # (B,)
+        d_t = t - last_knot_loc  # (B,)
+
+        # Integral of previous segments + square_area + triangular area
+        integral = C_k + h_k * d_t.unsqueeze(0) + s_k / 2 * delta.unsqueeze(0) ** 2  # (D,B)
+
+        return integral.T  # (B,D)
+
+    @staticmethod
+    def inverse_integral(x_knots: torch.Tensor, y_knots: torch.Tensor, u: torch.Tensor):
+        """Computes the inverse of the integral if defined (y_knots has to be strictly positive or negative).
+
+        Given u, finds t such that u = int_0^t spline(x_knots, y_knots, s) ds.
+
+        Args:
+            x_knots (torch.Tensor): Position of the splines. Shared between all splines. Shape: (K,)
+            y_knots (torch.Tensor): Height of the splines for each spline and each knot. Shape: (D,K)
+            u (torch.Tensor): Target integral values. Shape: (B, D)
+
+        Returns:
+            t (torch.Tensor): The time values producing the desired u's. Shape: (B, D)
+        """
+        assert (y_knots > 0).all() or (y_knots < 0).all(), (
+            "y_knots must be strictly positive or negative for invertibility"
+        )
+
+        D, K = y_knots.shape
+        B = u.shape[0]
+
+        # Compute segment properties
+        delta_times = x_knots[1:] - x_knots[:-1]  # (K-1,)
+        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (D, K-1)
+        slopes = delta_heights / delta_times  # (D, K-1)
+
+        segment_areas = y_knots[:, :-1] * delta_times + slopes / 2.0 * delta_times**2  # (D, K-1)
+
+        prefix_sums = torch.cumsum(segment_areas, dim=1)  # (D, K-1)
+        prefix_sums = F.pad(prefix_sums, (1, 0), value=0.0)  # (D, K) - integral from 0 to x_knots[k]
+
+        segment_slopes = F.pad(slopes, (0, 1), value=0.0)  # (D, K)
+
+        # For each (batch, dim), find which segment the target u falls into
+        # u has shape (B, D), prefix_sums has shape (D, K)
+        # Find k such that prefix_sums[d, k] <= u[b, d] < prefix_sums[d, k+1]
+        k = torch.searchsorted(prefix_sums.unsqueeze(0).expand((B, D, K)), u.unsqueeze(2), right=True) - 1
+        k = k.squeeze(2).T  # (B,D)
+
+        # Extract segment info for each (d, b) pair
+        # k has shape (D, B)
+        C_k = torch.gather(prefix_sums, 1, k)  # (D, B) - cumulative integral up to knot k
+        h_k = torch.gather(y_knots, 1, k)  # (D, B) - height at knot k
+        s_k = torch.gather(segment_slopes, 1, k)  # (D, B) - slope in segment k
+        x_k = x_knots[k]  # (D, B) - position of knot k
+
+        # We need to solve:  h_k * delta + s_k/2 * delta^2 = u - C_k
+        # Rearranging: s_k/2 * delta^2 + h_k * delta - (u - C_k) = 0
+        #            = s_k/2 * delta^2 + h_k * delta - c = 0
+
+        # Using quadratic formula: delta = (-h_k + sqrt(h_k^2 + 2*s_k*c)) / s_k
+
+        c_val = u.T - C_k  # (D, B)
+
+        # Handle two cases: non-zero slope (quadratic) and zero slope (linear)
+        slope_is_zero = torch.abs(s_k) < 1e-10
+
+        # For zero slope: h_k * delta = u - C_k => delta = (u - C_k) / h_k = c_val / h_k
+        delta_linear = c_val / h_k  # (D, B)
+
+        # For non-zero slope: solve quadratic
+        # s_k/2 * delta^2 + h_k * delta + c_val = 0
+        # delta = (-h_k + sqrt(h_k^2 + 2*s_k*c_val)) / s_k
+        discriminant = h_k**2 + 2 * s_k * c_val  # (D, B)
+        # Clamp to avoid numerical issues.
+        discriminant = torch.clamp(discriminant, min=0.0)
+        sqrt_disc = torch.sqrt(discriminant)
+
+        # Safe division for quadratic case to avoid NaN in tensors. Can lead to problems, even when masked.
+        # Learned that the hard way... Will be masked out later anyway.
+        s_k_safe = torch.where(slope_is_zero, torch.ones_like(s_k), s_k)
+        delta_quadratic = (-h_k + sqrt_disc) / s_k_safe
+        # Select based on whether slope is zero
+        delta = torch.where(slope_is_zero, delta_linear, delta_quadratic)  # (D, B)
+
+        # Compute final t values
+        t = x_k + delta  # (D, B)
+
+        return t.T  # (B, D)
+
+    @staticmethod
+    def _get_knot_info(x_knots, t: torch.Tensor):
+        """
+        Calculates indices and relative offsets for time points.
+        x_knots: Location of the knots (K,)
+        t: (batch_size,)
+        returns: k (indices, Shape:(B,)), delta (t - t_k, Shape:(B,))
+        """
+
+        k = torch.searchsorted(x_knots, t, right=True) - 1
+        delta = t - x_knots[k]
+        return k, delta
 
 
 # ==============================================================================
