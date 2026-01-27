@@ -482,11 +482,12 @@ class SplinePoissonProcess(TemporalPointProcess):
         h_marginal = h.sum(dim=0, keepdim=True)  # (1, K)
 
         # Invert: find t such that Lambda_marginal(t) = Lambda_target
+        # u has shape (B,), we need (B, 1) to match h_marginal's D=1
         t_next = LinearSpline.inverse_integral(
             self.knot_locs,
             h_marginal,
-            u.unsqueeze(0),  # (1, 1)
-        )  # (1, 1)
+            u.unsqueeze(1),  # (B, 1)
+        )  # (B, 1)
         t_next = t_next.squeeze(1)  # (B,)
         # Compute inter-arrival time
 
