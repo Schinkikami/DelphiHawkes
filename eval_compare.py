@@ -557,6 +557,8 @@ def load_tpp_model(model_type: str, D: int, args) -> TemporalPointProcess:
         ExpKernelHawkesProcess,
         SplineBaselineExpKernelHawkesProcess,
         NumericalSplineBaselineExpKernelHawkesProcess,
+        SoftplusConstExpIHawkesProcess,
+        SoftplusSplineExpIHawkesProcess,
     )
     from hawkes.hawkes.baseline_tpps import (
         PoissonProcess,
@@ -572,6 +574,14 @@ def load_tpp_model(model_type: str, D: int, args) -> TemporalPointProcess:
 
     elif model_type == "numerical_spline_hawkes":
         return NumericalSplineBaselineExpKernelHawkesProcess(D, num_knots=args.num_knots, delta_t=args.delta_t)
+
+    elif model_type == "soft_plus_const_exp_ihawkes":
+        return SoftplusConstExpIHawkesProcess(D, baseline_params=None, kernel_params=None)
+
+    elif model_type == "soft_plus_spline_exp_ihawkes":
+        return SoftplusSplineExpIHawkesProcess(
+            D, num_knots=args.num_knots, delta_t=args.delta_t, baseline_params=None, kernel_params=None
+        )
 
     elif model_type == "poisson":
         return PoissonProcess(D=D)

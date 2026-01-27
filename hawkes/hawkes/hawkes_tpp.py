@@ -722,8 +722,18 @@ class ExpKernelParams:
     beta: torch.Tensor  # Shape: (D,D)
 
 
+# UnconstrainedExpKernelParams is an alias for ExpKernelParams
+# Both have the same structure, but the semantics differ:
+# - ExpKernelParams: alpha values should be positive (for excitatory processes)
+# - UnconstrainedExpKernelParams: alpha can be positive or negative (for inhibitive processes)
+UnconstrainedExpKernelParams = ExpKernelParams
+
+
 class ExpKernelModule(KernelIntensityModule):
-    """Exponential kernel module for self-exciting Hawkes processes."""
+    """Exponential kernel module for self-exciting Hawkes processes.
+
+    Alpha values are constrained to be positive via softplus.
+    """
 
     def __init__(
         self,
@@ -734,8 +744,7 @@ class ExpKernelModule(KernelIntensityModule):
         """
         Args:
             D: Number of event types
-            alpha: Branching ratio matrix (D,D). If None, initialized randomly.
-            beta: Decay rate matrix (D,D). If None, initialized randomly.
+            params: Kernel parameters. If None, initialized randomly.
             seed: Random seed
         """
         super().__init__(D)
@@ -746,28 +755,34 @@ class ExpKernelModule(KernelIntensityModule):
         self.generator = generator
 
         if params is None:
-            # Random decay rates: effect decays with random time constants
-            ratios_every_years = torch.rand(size=(D, D)) * (10 - 1 / 12) + 1 / 12
-            beta = 1 / ratios_every_years
-
-            # Random amplitude, then rescale for target branching ratio
-            alphas = torch.rand(size=(D, D)) * 100 + 1
-            max_eig = torch.max(torch.abs(torch.linalg.eigvals(alphas)))
-            targeted_branching_ratio = 0.5
-            alpha = (1 / max_eig) * targeted_branching_ratio * alphas
-
-            ratios_every_years = torch.rand(size=(D, D)) * (10 - 1 / 12) + 1 / 12
-            beta = 1 / ratios_every_years
-
+            alpha, beta = self._init_random_params(D, generator)
         else:
             alpha = params.alpha
             beta = params.beta
 
+        self._init_parameters(alpha, beta)
+
+    def _init_random_params(self, D: int, generator: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Initialize random alpha and beta values."""
+        # Random decay rates: effect decays with random time constants
+        ratios_every_years = torch.rand(size=(D, D), generator=generator) * (10 - 1 / 12) + 1 / 12
+        beta = 1 / ratios_every_years
+
+        # Random amplitude, then rescale for target branching ratio
+        alphas = torch.rand(size=(D, D), generator=generator) * 100 + 1
+        max_eig = torch.max(torch.abs(torch.linalg.eigvals(alphas)))
+        targeted_branching_ratio = 0.5
+        alpha = (1 / max_eig) * targeted_branching_ratio * alphas
+
+        return alpha, beta
+
+    def _init_parameters(self, alpha: torch.Tensor, beta: torch.Tensor):
+        """Initialize the learnable parameters. Override in subclasses for different constraints."""
         self.log_alpha = nn.Parameter(inverse_softplus(alpha))
         self.log_beta = nn.Parameter(inverse_softplus(beta))
 
     def transform_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return constrained parameters (alpha, beta)."""
+        """Return constrained parameters (alpha, beta). Override in subclasses."""
         return F.softplus(self.log_alpha), F.softplus(self.log_beta)
 
     def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
@@ -885,6 +900,43 @@ class ExpKernelModule(KernelIntensityModule):
         interaction_terms[~valid_event_mask] = 0.0
 
         return interaction_terms.sum(dim=2)  # Shape: (B,N)
+
+
+class UnconstrainedExpKernelModule(ExpKernelModule):
+    """
+    Exponential kernel module for inhibitive Hawkes processes.
+
+    Inherits from ExpKernelModule but with unconstrained alpha (can be negative for inhibition).
+    Beta remains positive (decay rate).
+
+    Kernel function: φ_{d,j}(Δt) = α_{d,j} β_{d,j} exp(-β_{d,j} Δt)
+
+    When α < 0, past events inhibit (reduce) future intensity.
+    When α > 0, past events excite (increase) future intensity.
+    """
+
+    def _init_random_params(self, D: int, generator: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Initialize random alpha (centered around 0) and positive beta values."""
+        # Random decay rates: effect decays with random time constants
+        ratios_every_years = torch.rand(size=(D, D), generator=generator) * (10 - 1 / 12) + 1 / 12
+        beta = 1 / ratios_every_years
+
+        # Random alpha - unconstrained, can be positive or negative
+        # Initialize with small values centered around 0
+        alpha = torch.randn(size=(D, D), generator=generator) * 0.1
+
+        return alpha, beta
+
+    def _init_parameters(self, alpha: torch.Tensor, beta: torch.Tensor):
+        """Initialize parameters with unconstrained alpha."""
+        # Alpha is unconstrained (stored directly)
+        self.alpha = nn.Parameter(alpha)
+        # Beta must be positive (use softplus constraint)
+        self.log_beta = nn.Parameter(inverse_softplus(beta))
+
+    def transform_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return parameters: unconstrained alpha, positive beta."""
+        return self.alpha, F.softplus(self.log_beta)
 
 
 class ExpKernelHawkesProcess(HawkesProcess):
@@ -1017,15 +1069,61 @@ class NumericalSplineBaselineExpKernelHawkesProcess(HawkesProcess):
 
 
 class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
+    """
+    Inhibitive Hawkes process with constant baseline and unconstrained exponential kernel.
+
+    Uses softplus to ensure non-negative total intensity: λ(t) = softplus(μ + kernel(t))
+
+    The kernel alpha values are unconstrained, allowing:
+    - Positive alpha: excitation (past events increase future intensity)
+    - Negative alpha: inhibition (past events decrease future intensity)
+    """
+
     def __init__(
         self,
         D,
         baseline_params: Optional[ConstantBaselineParams],
-        kernel_params: Optional[ExpKernelParams],
+        kernel_params: Optional[UnconstrainedExpKernelParams],
         seed: Optional[int] = 42,
     ):
         baseline = ConstantBaselineModule(D, baseline_params)
-        kernel = ExpKernelModule(D, kernel_params)
+        kernel = UnconstrainedExpKernelModule(D, kernel_params, seed)
+        super().__init__(F.softplus, baseline, kernel, D, seed)
+
+
+class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
+    """
+    Inhibitive Hawkes process with spline baseline and unconstrained exponential kernel.
+
+    Uses softplus to ensure non-negative total intensity: λ(t) = softplus(spline(t) + kernel(t))
+
+    The kernel alpha values are unconstrained, allowing:
+    - Positive alpha: excitation (past events increase future intensity)
+    - Negative alpha: inhibition (past events decrease future intensity)
+    """
+
+    def __init__(
+        self,
+        D: int,
+        num_knots: int,
+        delta_t: torch.Tensor | float,
+        baseline_params: Optional[SplineBaselineParams] = None,
+        kernel_params: Optional[UnconstrainedExpKernelParams] = None,
+        seed: Optional[int] = 42,
+    ):
+        """
+        Initialize spline-based baseline inhibitive Hawkes process.
+
+        Args:
+            D: Number of event types
+            num_knots: Number of knots for the spline baseline
+            delta_t: Spacing between knots (float for uniform, tensor for variable)
+            baseline_params: Spline baseline parameters. If None, initialized randomly.
+            kernel_params: Kernel parameters. If None, initialized randomly.
+            seed: Random seed
+        """
+        baseline = SplineBaselineModule(D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed)
+        kernel = UnconstrainedExpKernelModule(D, kernel_params, seed)
         super().__init__(F.softplus, baseline, kernel, D, seed)
 
 
