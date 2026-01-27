@@ -169,20 +169,31 @@ class BatchedMVEventData(TensorDict):
 
     @property
     def max_time(self):
-        """Returns the time of the last event per sequence."""
+        """Returns the time of the last event per sequence.
+
+        For empty sequences (length 0), returns 0.0.
+        For empty batch (0 sequences), returns empty tensor of shape (0,).
+        """
         if len(self.seq_lengths) == 0:
             return torch.empty(0, dtype=self.time_points.dtype, device=self.time_points.device)
 
-        # Handle sequences with mixed lengths, including empty sequences (length 0)
         seq_lengths_tensor = torch.tensor(self.seq_lengths, device=self.time_points.device)
+
+        # If all sequences are empty, time_points has shape (B, 0) and we can't index it
+        # Just return zeros for all sequences
+        if self.time_points.shape[1] == 0:
+            return torch.zeros(len(self.seq_lengths), dtype=self.time_points.dtype, device=self.time_points.device)
+
         batch_indices = torch.arange(len(self.seq_lengths), device=self.time_points.device)
 
-        # For sequences with length > 0, get the last time_point; for length 0, use 0.0 as placeholder
-        # Note: Empty sequences (length 0) will have their max_time set to the padding value from time_points
+        # For sequences with length > 0, get the last time_point; for length 0, index 0 (will be overwritten)
         last_indices = torch.where(seq_lengths_tensor > 0, seq_lengths_tensor - 1, 0)
         max_times = self.time_points[batch_indices, last_indices]
 
-        # For empty sequences, the max_time is actually undefined, we return 0
+        # For empty sequences, set max_time to 0
+        empty_mask = seq_lengths_tensor == 0
+        max_times = torch.where(empty_mask, torch.zeros_like(max_times), max_times)
+
         return max_times
 
     def to(self, device):

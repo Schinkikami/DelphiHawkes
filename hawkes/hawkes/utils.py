@@ -383,44 +383,58 @@ def invert_monotone_newton(
     Uses Newton's method with derivative provided by d_func.
     Falls back to bisection when Newton proposes values outside the [low, high] bracket or derivative is too small.
 
+    Supports batched operations where all inputs and outputs are tensors of shape (T,).
+
     Args:
-        monot_func: callable T -> monot_func(T) (float)
-        d_func: callable T -> d_func(T) (float, derivative)
-        target: target cumulative value
-        low, high: bracket with ci(low) <= target <= ci(high)
+        monot_func: callable that takes tensor of shape (T,) and returns tensor of shape (T,)
+        d_func: callable that takes tensor of shape (T,) and returns tensor of shape (T,) (derivative)
+        target: target cumulative values. Shape: (T,)
+        low, high: bracket with ci(low) <= target <= ci(high). Shape: (T,)
         tol: tolerance on |ci(T)-target|
         max_iters: maximum iterations
 
     Returns:
-        T (float)
+        T: inverted values. Shape: (T,)
     """
     # Start at midpoint
     T = 0.5 * (low + high)
 
+    # Track which elements have converged
+    converged = torch.zeros_like(T, dtype=torch.bool)
+
     for _ in range(max_iters):
-        ci_val = float(monot_func(T, **mono_kwargs))
+        ci_val = monot_func(T, **mono_kwargs)
         resid = ci_val - target
-        if abs(resid) <= tol:
+
+        # Check convergence
+        newly_converged = torch.abs(resid) <= tol
+        converged = converged | newly_converged
+
+        if converged.all():
             return T
 
-        lam = float(d_func(T, **d_kwargs))
-        # avoid tiny derivative
-        if lam <= 1e-12 or not (lam == lam):
-            # bisection
-            T_new = 0.5 * (low + high)
-        else:
-            T_new = T - resid / lam
+        lam = d_func(T, **d_kwargs)
 
-        # If Newton step leaves bracket or is nan/inf, fall back to bisection
-        if not (T_new > low and T_new < high and (T_new == T_new)):
-            T_new = 0.5 * (low + high)
+        # Identify where we need bisection (tiny or invalid derivative)
+        use_bisection = (lam <= 1e-12) | torch.isnan(lam)
 
-        ci_new = float(monot_func(T_new, **mono_kwargs))
-        # update bracket
-        if ci_new < target:
-            low = T_new
-        else:
-            high = T_new
+        # Compute Newton step where valid
+        T_newton = T - resid / torch.where(use_bisection, torch.ones_like(lam), lam)
+
+        # Compute bisection step
+        T_bisection = 0.5 * (low + high)
+
+        # Use bisection if Newton step leaves bracket or is nan/inf
+        out_of_bracket = (T_newton <= low) | (T_newton >= high) | torch.isnan(T_newton) | torch.isinf(T_newton)
+        T_new = torch.where(use_bisection | out_of_bracket, T_bisection, T_newton)
+
+        # Don't update already converged elements
+        T_new = torch.where(converged, T, T_new)
+
+        # Update bracket
+        ci_new = monot_func(T_new, **mono_kwargs)
+        low = torch.where((ci_new < target) & ~converged, T_new, low)
+        high = torch.where((ci_new >= target) & ~converged, T_new, high)
 
         T = T_new
 
