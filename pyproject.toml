@@ -23,6 +23,7 @@ dependencies = [
     "jaxtyping>=0.3.3",
     "lovely-tensors>=0.1.20",
     "matplotlib>=3.10.7",
+    "networkx>=3.6",
     "nflows>=0.14",
     "numpy<2.0",
     "pandas>=2.3.3",

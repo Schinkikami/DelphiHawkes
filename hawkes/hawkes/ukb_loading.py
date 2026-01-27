@@ -28,7 +28,7 @@ def load_ukb_sequences(
 
     num_events = death_token + 1
 
-    time_points = time_points / 365.0  # Convert to years
+    time_points = time_points / 365.25  # Convert to years
     time_points /= 80  # Encode in 80 years to have be better numerical stability.
     # Split data by batch id
     sequences = []

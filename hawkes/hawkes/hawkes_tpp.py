@@ -2,7 +2,7 @@
 # %%
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -325,6 +325,98 @@ class HawkesProcess(TemporalPointProcess, ABC):
         return positive_likelihood
 
 
+class InhibitiveHawkesProcess(TemporalPointProcess, ABC):
+    """
+    Abstract base class for Inhibitive Hawkes processes with modular baseline and kernel.
+
+    A Hawkes process combines:
+    - A baseline module (exogenous intensity)
+    - A kernel module (endogenous self-exciting component)
+
+    The total intensity is: λ(t) = baseline(t) + kernel(t)
+    """
+
+    def __init__(
+        self,
+        positive_constraint: Callable,
+        baseline: BaselineIntensityModule,
+        kernel: KernelIntensityModule,
+        D: int,
+        seed: Optional[int] = 42,
+    ):
+        """
+        Args:
+            baseline: BaselineIntensityModule instance
+            kernel: KernelIntensityModule instance
+            D: Number of event types
+            seed: Random seed
+        """
+        super().__init__(D, seed, use_analytical_ci=False)
+        self.baseline = baseline
+        self.kernel = kernel
+        self.positivity_constraint = positive_constraint
+
+        assert self.baseline.D == D, "Baseline dimension mismatch"
+        assert self.kernel.D == D, "Kernel dimension mismatch"
+
+    def transform_params(self) -> Tuple[torch.Tensor, ...]:
+        """
+        Return all parameters in constrained form.
+
+        Returns:
+            (baseline_params, *kernel_params)
+        """
+        baseline_params = self.baseline.transform_params()
+        kernel_params = self.kernel.transform_params()
+        return (*baseline_params, *kernel_params)
+
+    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """
+        Compute total intensity = baseline + kernel.
+
+        Args:
+            t: Time points. Shape: (B,)
+            ts: Historical events. Shape: (B,N)
+
+        Returns:
+            Total intensity. Shape: (B,D)
+        """
+        baseline_intensity = self.baseline.intensity(t, ts)  # (B,D)
+        kernel_intensity = self.kernel.intensity(t, ts)  # (B,D)
+        return self.positivity_constraint(baseline_intensity + kernel_intensity)
+
+    def positive_likelihood(self, ts: BatchedMVEventData, log: bool = True) -> torch.Tensor:
+        """
+        Compute the likelihood of observing the events (product of intensities at event times).
+
+        This is the standard Hawkes process likelihood computation, shared across all variants.
+        """
+        # Identify valid (non-padded) events
+        valid_events = ts.event_types != -1
+
+        baseline_intensities = self.baseline.positive_likelihood_intensities(ts)  # (B,N)
+        interaction_terms = self.kernel.positive_likelihood_intensities(ts)  # (B,N)
+
+        intensities = self.positivity_constraint(baseline_intensities + interaction_terms)  # (B,N)
+
+        min_intensity = 1e-12
+        if log:
+            intensities_clamped = torch.clamp(intensities, min=min_intensity)
+            log_intensities = torch.log(intensities_clamped)
+            log_intensities[~valid_events] = 0.0
+            positive_likelihood = torch.sum(log_intensities, dim=-1)  # Shape: (B,)
+        else:
+            intensities = torch.clamp(intensities, min=min_intensity)
+            intensities[~valid_events] = 1.0
+            positive_likelihood = torch.prod(intensities, dim=-1)  # Shape: (B,)
+
+        # Mask out sequences with no events
+        num_0 = valid_events.sum(dim=1) == 0
+        positive_likelihood[num_0] = torch.tensor(0.0) if log else torch.tensor(1.0)
+
+        return positive_likelihood
+
+
 # ============================================================================
 # Concrete Implementations of Baseline and Kernel Modules
 # ============================================================================
@@ -368,6 +460,143 @@ class ConstantBaselineModule(BaselineIntensityModule):
         """Cumulative intensity: mu * T."""
         (mu,) = self.transform_params()  # Shape: (D,)
         return mu.unsqueeze(0) * T.unsqueeze(1)  # Shape: (B,D)
+
+
+@dataclass
+class LinearBaselineParams:
+    mu: torch.Tensor  # Shape: (D,)
+    slope: torch.Tensor  # Shape: (D,)
+
+
+class LinearBaselineModule(BaselineIntensityModule):
+    def __init__(
+        self,
+        params: Optional[LinearBaselineParams] = None,
+        D: Optional[int] = None,
+        seed: Optional[int] = 42,
+    ):
+        """Initialize the Conditional Poisson process.
+
+        Args:
+            params: Poisson process parameters or None to initialize randomly
+            D: Event dimension (required if params is None)
+            seed: random seed for initialization
+            reg_lambda: regularization parameter
+        """
+        super().__init__(D)
+
+        generator = torch.Generator()
+        if seed is not None:
+            generator = generator.manual_seed(seed)
+
+        self.generator = generator
+
+        if params is None and D is None:
+            raise ValueError("Either params or D (number of dimensions) must be provided.")
+
+        if params is None:
+            # The only parameters are the baserates mu.
+            # TODO parameter inits problematic.
+            mu = torch.log(torch.rand(size=(D,)))  # torch.log(torch.rand(size=(D,)) * (10 - 1 / 12) + 1 / 12)
+            slope = torch.zeros(size=(D,))  # torch.log(torch.rand(size=(D,)) * (10 - 1 / 12) + 1 / 12)
+            self.mu = torch.nn.Parameter(mu)
+            self.slope = torch.nn.Parameter(slope)
+            self.D = D
+
+        else:
+            if D is None:
+                D = params.mu.shape[0]
+
+            assert params.mu.shape[0] == D, "Dimension mismatch in mu"
+            self.mu = torch.nn.Parameter(params.mu)
+            self.slope = torch.nn.Parameter(params.slope)
+            self.D = D
+
+    def get_rate_slope(self):
+        mu = self.transform_params()
+
+        return {"mu": mu, "slope": self.slope}
+
+    def transform_params(self):
+        # Constrain parameters mu to be positive
+        return self.mu, self.slope
+
+    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData):
+        # Computes the intensity at time t for each batch.
+        # Returns intensity with shape (batch_size, D)
+
+        # lambda_d(t) = exp(mu_d + slope_d * t) (inhomogeneous Poisson with log-linear intensity)
+
+        mu, slope = self.transform_params()
+
+        intensity = torch.exp(mu.unsqueeze(0) + slope.unsqueeze(0) * t.unsqueeze(1))  # Shape: (B,D)
+        return intensity
+
+    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+        """
+        Computes the cumulative intensity function from t=0 up to T, not from the last event time, as we need the full integral for the likelihood.
+        To obtain the cumulative intensity from t_n up to T, consider subtracting the CIs.--> cumulative_intensity(T) - cumulative_intensity(t_n)
+
+        :param self: Description
+        :param T: Description
+        :type T: torch.Tensor
+        :param ts: Description
+        :type ts: BatchedMVEventData
+        """
+
+        mu, slope = self.transform_params()
+
+        slope_0 = torch.abs(slope) < 1e-8
+
+        # At slope == 0 (or very close) we use the Taylor expansion to avoid division by zero.
+        # This is better than adding a deadzone to the gradient: lim b-> 0 int_0^T exp(a+bt) dt = int_0^T exp(a) dt = exp(a) *T. However this forumulation does not have gradient for b.
+        # Taylor at very small b: exp(bT) ~ 1 for very small b.
+        # Therefore exp(bT) = 1 + bT + b^2T^2/2 + ... at these very small b.
+        # --> (exp(bT) -1)/b = T + bT^2/2 + b^2T^3/6 + ...
+        # --> e^mu * (exp(bT) -1)/b = e^mu * (T + bT^2/2 + b^2T^3/6 + ...)
+        taylor_expansion_at_b = torch.exp(mu.unsqueeze(1)) * (
+            T.unsqueeze(0)
+            + slope.unsqueeze(1) * T.unsqueeze(0) ** 2 / 2
+            + slope.unsqueeze(1) ** 2 * T.unsqueeze(0) ** 3 / 6
+        )
+
+        fixed_slope = slope.clone()
+        fixed_slope[slope_0] = 1.0  # avoid division by zero
+
+        closed_form_integral = torch.zeros_like(taylor_expansion_at_b)
+        closed_form_integral = (
+            torch.exp(mu.unsqueeze(1))
+            / fixed_slope.unsqueeze(1)
+            * (torch.exp(fixed_slope.unsqueeze(1) * T.unsqueeze(0)) - 1)
+        )
+
+        # Here we replace the normal integral form of int_0^T exp(mu +slope t) dt = 1/b exp(mu + slope T) - 1/b exp(mu) = 1/b * exp(mu) * (exp(slope T) - 1) = 1/b *exp(mu) * expm1(slop T).
+        integral = torch.where(
+            slope_0.unsqueeze(1),
+            taylor_expansion_at_b,  # torch.exp(mu.unsqueeze(1)) * T.unsqueeze(0),
+            closed_form_integral,  # torch.exp(mu.unsqueeze(1) + slope.unsqueeze(1) * T.unsqueeze(0)) / slope.unsqueeze(1)
+        )  # Shape: (D,B)
+
+        return integral.T  # Shape: (B,D)
+
+    def positive_likelihood_intensities(
+        self,
+        ts: BatchedMVEventData,
+    ):
+        # Shape ts: [batch_size, len]
+        # ts arrays are right padded. -1 for type and the largest number for time.
+
+        # Identify valid (non-padded) events
+        valid_events = ts.event_types != -1
+
+        # Shape: D
+        mu, slope = self.transform_params()
+
+        # Clamp event_types to avoid negative indexing for padded entries (-1)
+        clamped_types = ts.event_types.clamp(min=0)
+        intensities = torch.exp(mu[clamped_types] + slope[clamped_types] * ts.time_points)  # Shape: (B,N,)
+        masked_intensities = intensities * valid_events.float()
+        return masked_intensities
 
 
 @dataclass
@@ -472,7 +701,7 @@ class SplineBaselineModule(BaselineIntensityModule):
 
         # ATTENTION! Only works because it is independent from the past values. Does not use ts.
         all_intensities = self.intensity(flat_times, ts)  # (B*N, D)
-        all_intensities = all_intensities.T.view(ts.shape[0], ts.shape[1], self.D)  # (B, N, D)
+        all_intensities = all_intensities.view(ts.shape[0], ts.shape[1], self.D)  # (B, N, D)
 
         # Select the intensity corresponding to the actual event type
         # event_types shape: (B, N)
@@ -576,8 +805,8 @@ class ExpKernelModule(KernelIntensityModule):
         """
 
         valid_mask = ts.event_types != -1  # Shape: (B,N)
-        future_event_mask = ts.time_points >= T.unsqueeze(1)  # Shape: (B,N)
-        valid_mask = valid_mask & ~future_event_mask
+        past_event_mask = ts.time_points < T.unsqueeze(1)  # Shape: (B,N)
+        valid_mask = valid_mask & past_event_mask
 
         alpha, beta = self.transform_params()
 
@@ -688,6 +917,35 @@ class ExpKernelHawkesProcess(HawkesProcess):
         super().__init__(baseline, kernel, D, seed)
 
 
+class LinearBaselineExpKernelHawkesProcess(HawkesProcess):
+    """
+    Reimplementation of Hawkes process with exponential kernel using modular architecture.
+
+    This version uses the HawkesProcess base class with ConstantBaselineModule and ExpKernelModule.
+    """
+
+    def __init__(
+        self,
+        D: int,
+        baseline_params: Optional[LinearBaselineParams] = None,
+        kernel_params: Optional[ExpKernelParams] = None,
+        seed: Optional[int] = 42,
+    ):
+        """
+        Initialize exponential kernel Hawkes process with a linear function baseline intensity
+
+        Args:
+            D: Number of event types
+            baseline_params: If None, initialized randomly.
+            kernel_params: If None, initialized randomly.
+            seed: Random seed
+        """
+        baseline = LinearBaselineModule(baseline_params, D, seed)
+        kernel = ExpKernelModule(D, kernel_params, seed)
+
+        super().__init__(baseline, kernel, D, seed)
+
+
 class SplineBaselineExpKernelHawkesProcess(HawkesProcess):
     """
     Hawkes process with spline-based baseline intensity and exponential kernel.
@@ -719,6 +977,56 @@ class SplineBaselineExpKernelHawkesProcess(HawkesProcess):
         kernel = ExpKernelModule(D, kernel_params, seed)
 
         super().__init__(baseline, kernel, D, seed)
+
+
+class NumericalSplineBaselineExpKernelHawkesProcess(HawkesProcess):
+    """
+    Hawkes process with spline-based baseline intensity and exponential kernel.
+
+    This version uses the HawkesProcess base class with SplineBaselineModule and ExpKernelModule.
+    """
+
+    def __init__(
+        self,
+        D: int,
+        num_knots: int,
+        delta_t: torch.Tensor | float,
+        baseline_params: Optional[SplineBaselineParams] = None,
+        kernel_params: Optional[ExpKernelParams] = None,
+        seed: Optional[int] = 42,
+    ):
+        """
+        Initialize spline-based baseline exponential kernel Hawkes process.
+
+        Args:
+            D: Number of event types
+            baseline_knots: Knots for spline baseline (num_knots,). If None, initialized randomly.
+            baseline_coefs: Coefficients for spline baseline (D, num_coefs). If None, initialized randomly.
+            alpha: Branching ratio matrix (D,D). If None, initialized randomly.
+            beta: Decay rate matrix (D,D). If None, initialized randomly.
+            seed: Random seed
+        """
+        baseline = SplineBaselineModule(D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed)
+        kernel = ExpKernelModule(D, kernel_params, seed)
+
+        super().__init__(baseline, kernel, D, seed)
+
+        self.use_analytical_ci = False  # Use numerical CI from base class
+        self.ci_num_points = 10
+        self.ci_integration_method = "mc_trapezoidal"
+
+
+class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
+    def __init__(
+        self,
+        D,
+        baseline_params: Optional[ConstantBaselineParams],
+        kernel_params: Optional[ExpKernelParams],
+        seed: Optional[int] = 42,
+    ):
+        baseline = ConstantBaselineModule(D, baseline_params)
+        kernel = ExpKernelModule(D, kernel_params)
+        super().__init__(F.softplus, baseline, kernel, D, seed)
 
 
 # %%

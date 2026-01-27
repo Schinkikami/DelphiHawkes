@@ -80,7 +80,12 @@ class LinearSpline(torch.nn.Module):
         d_t = t - last_knot_loc  # (B,)
 
         # Integral of previous segments + square_area + triangular area
-        integral = C_k + h_k * d_t.unsqueeze(0) + s_k / 2 * delta.unsqueeze(0) ** 2  # (D,B)
+        # Done like this to avoid zero multiplications which can lead to NaNs if d_t is Infinite
+        integral = C_k
+        integral += torch.where(h_k != 0.0, h_k * d_t.unsqueeze(0), torch.zeros_like(h_k))
+        integral += torch.where(s_k != 0.0, s_k / 2 * delta.unsqueeze(0) ** 2, torch.zeros_like(s_k))
+        # (D,B)
+        # integral = C_k + h_k * d_t.unsqueeze(0) + s_k / 2 * delta.unsqueeze(0) ** 2  # (D,B)
 
         return integral.T  # (B,D)
 
@@ -245,20 +250,18 @@ def monte_carlo_trapezoidal_integration(
     Returns:
         Integral values. Shape: (B, D)
     """
+    device = ts.time_points.device
+
     if rng is None:
-        rng = torch.Generator()
+        rng = torch.Generator(device=device)
 
     B = ts.shape[0]
-
-    device = t_start.device
 
     random_points = (t_end - t_start).unsqueeze(1) * torch.rand(
         (B, num_points - 2), generator=rng, device=device
     ) + t_start.unsqueeze(1)  # (B, num_points-2)
 
-    t_vals = torch.cat(
-        [torch.tensor([t_start], device=device), random_points, torch.tensor([t_end], device=device)], dim=1
-    )  # (B, num_points)
+    t_vals = torch.cat([t_start.unsqueeze(1), random_points, t_end.unsqueeze(1)], dim=1)  # (B, num_points)
 
     # Sort
     t_vals, _ = torch.sort(t_vals, dim=1)
@@ -321,37 +324,43 @@ def bracket_monotone(
     func_kwargs: dict = dict(),
 ):
     """
-    Find a bracket [low, high] such that ci_func(high) >= target assuming ci_func is monotonically increasing in its scalar argument.
+    Find a bracket [low, high] such that monot_func(high) >= target assuming monot_func is monotonically increasing.
+
+    Supports batched operations where low, target, and monot_func output are tensors of shape (T,).
 
     Args:
-        ci_func: callable T -> scalar cumulative value (float)
-        low: starting lower bound (float)
-        target: target cumulative value (float)
-        initial_high: optional initial high to try; if None, uses low + 1.0
+        monot_func: callable that takes tensor of shape (T,) and returns tensor of shape (T,)
+        low: starting lower bounds. Shape: (T,)
+        target: target cumulative values. Shape: (T,)
+        initial_high: optional initial high to try; if None, uses low + 1.0. Shape: (T,) or None
         expand_factor: multiplicative expansion factor for high
         max_expands: maximum number of expansions
 
     Returns:
-        (low, high, ci_low, ci_high)
+        (low, high, ci_low, ci_high) - all tensors of shape (T,)
     """
     if initial_high is None:
         high = low + 1.0
     else:
-        high = initial_high
+        high = initial_high.clone()
 
-    ci_low = float(monot_func(low, **func_kwargs))
-    ci_high = float(monot_func(high, **func_kwargs))
+    ci_low = monot_func(low, **func_kwargs)
+    ci_high = monot_func(high, **func_kwargs)
+
+    # Track which elements still need expansion
+    needs_expand = ci_high < target
 
     expands = 0
-    while ci_high < target and expands < max_expands:
-        # expand geometrically
+    while needs_expand.any() and expands < max_expands:
+        # Exponentially expand the span for elements that need it
         span = high - low
-        if span <= 0:
-            high = low + (2**expands)
-        else:
-            high = low + max(span * expand_factor, 1.0 * (2**expands))
+        new_high = low + span * expand_factor
 
-        ci_high = float(monot_func(high, **func_kwargs))
+        # Only update elements that need expansion
+        high = torch.where(needs_expand, new_high, high)
+
+        ci_high = monot_func(high, **func_kwargs)
+        needs_expand = ci_high < target
         expands += 1
 
     return low, high, ci_low, ci_high

@@ -180,18 +180,19 @@ class PoissonProcess(TemporalPointProcess):
 
             # The rate of the superimposed process is the sum of the individual rates
             lamb = mu.sum()
+            CI_at_last = (mu * t_last).sum().item()
+
             # We now solve for inter-arrival time delta in u = CDF(delta) = 1 - exp(-lamb * delta)
             # => delta = -log(1-u)/lamb
-            delta = -torch.log1p(-torch.tensor(u)).item() / lamb
 
-            # Absolute time of next event
-            t_star = t_last + delta
+            # As we deal in absolute times here, we need to adjust for the cumulative intensity at t_last
+            t_star = (-torch.log1p(-torch.tensor(u)).item() + CI_at_last) / lamb
 
             # Compute type-distribution at t_star
             probs = mu / lamb
             type_idx = torch.multinomial(probs, num_samples=1, generator=rng)
 
-            time_samples.append(delta)  # Store inter-arrival time
+            time_samples.append(t_star)  # Store inter-arrival time
             dist_samples.append(probs)
 
             T_tensor = torch.tensor([t_star], dtype=ts.time_points.dtype, device=device)
@@ -456,18 +457,18 @@ class SplinePoissonProcess(TemporalPointProcess):
         ts: BatchedMVEventData,
     ) -> torch.Tensor:
         """
-        Invert the marginal cumulative intensity to find t such that Λ(t) - Λ(t_last) = u.
+        Invert the marginal cumulative intensity to find t such that Λ(t) = u.
 
         This function returns the ABSOLUTE time t, not a relative delta.
         The computation finds t such that the integral of the marginal intensity
-        from t_last (last event time) to t equals u.
+        from 0 to t equals u.
 
         Args:
-            u: Target cumulative intensity increments (typically -log(1-uniform)). Shape: (batch_size,)
+            u: Target marginal cumulative intensity value (typically -log(1-uniform) + Λ(t_last)). Shape: (batch_size,)
             ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
 
         Returns:
-            Absolute time values t such that Λ(t) - Λ(t_last) ≈ u. Shape: same as u
+            Absolute time values t such that Λ(t) ≈ u. Shape: same as u
 
         Useful for sampling via inverse CDF method.
         """
@@ -475,35 +476,18 @@ class SplinePoissonProcess(TemporalPointProcess):
         assert u.shape[0] == ts.time_points.shape[0], "u must have the same batch size as ts"
 
         (h,) = self.get_heights()  # (D, K)
-        device = ts.time_points.device
 
         # Build the marginal intensity by summing across dimensions
         # h_marginal[k] = sum_d h[d, k]
         h_marginal = h.sum(dim=0, keepdim=True)  # (1, K)
 
-        t_start = ts.time_points.max() if ts.time_points.numel() > 0 else torch.tensor(0.0, device=device)
-
-        # Compute cumulative intensity of marginal process at t_start
-        # Lambda_marginal(t) = sum_d Lambda_d(t) = integral of sum_d lambda_d(s) from 0 to t
-        if t_start > 0:
-            Lambda_start = LinearSpline.integrate(self.knot_locs, h_marginal, t_start.unsqueeze(0))  # (1, 1)
-            Lambda_start = Lambda_start.squeeze()  # scalar
-        else:
-            Lambda_start = torch.tensor(0.0, device=device)
-
-        # Sample u ~ Uniform(0, 1) and compute inverse of target cumulative intensity
-        # u = 1 - exp(-(Lambda_target - Lambda_start)) => CDF inversion
-        # 1 -u = exp(-(Lambda_target - Lambda_start)) => -log(1-u) = Lambda_target - Lambda_start
-        Lambda_target = Lambda_start + u  # u passed into here is -log(1-sampled_u).
-
         # Invert: find t such that Lambda_marginal(t) = Lambda_target
         t_next = LinearSpline.inverse_integral(
             self.knot_locs,
             h_marginal,
-            Lambda_target.unsqueeze(0).unsqueeze(0),  # (1, 1)
+            u.unsqueeze(0),  # (1, 1)
         )  # (1, 1)
-        t_next = t_next.squeeze()  # scalar
-
+        t_next = t_next.squeeze(1)  # (B,)
         # Compute inter-arrival time
 
         return t_next
@@ -520,7 +504,7 @@ class SplinePoissonProcess(TemporalPointProcess):
 
         # ATTENTION! Only works because it is independent from the past values. Does not use ts.
         all_intensities = self.intensity(flat_times, ts)  # (B*N, D)
-        all_intensities = all_intensities.T.view(ts.shape[0], ts.shape[1], self.D)  # (B, N, D)
+        all_intensities = all_intensities.view(ts.shape[0], ts.shape[1], self.D)  # (B, N, D)
 
         # Select the intensity corresponding to the actual event type
         # event_types shape: (B, N)
@@ -539,85 +523,85 @@ class SplinePoissonProcess(TemporalPointProcess):
             event_intensities[~valid_events] = 1.0
             return torch.prod(event_intensities, dim=-1)
 
-    def sample(self, ts: MVEventData, num_steps: int = 1, rng: Optional[torch.Generator | int] = None):
-        """
-        Sampling via Superposition + Inverse CDF Transform.
+    # def sample(self, ts: MVEventData, num_steps: int = 1, rng: Optional[torch.Generator | int] = None):
+    #     """
+    #     Sampling via Superposition + Inverse CDF Transform.
 
-        Strategy:
-        1. Build the marginal (superposition) process by summing intensities across all D dimensions
-        2. Sample inter-arrival times from the marginal process using inverse transform
-        3. At each sampled time, determine event type via categorical distribution weighted by intensities
+    #     Strategy:
+    #     1. Build the marginal (superposition) process by summing intensities across all D dimensions
+    #     2. Sample inter-arrival times from the marginal process using inverse transform
+    #     3. At each sampled time, determine event type via categorical distribution weighted by intensities
 
-        Args:
-            ts (MVEventData): Conditioned past events.
-            num_steps (int, optional): Number of steps for generation. Defaults to 1.
-            rng (Optional[torch.Generator], optional): Random state. Defaults to None.
+    #     Args:
+    #         ts (MVEventData): Conditioned past events.
+    #         num_steps (int, optional): Number of steps for generation. Defaults to 1.
+    #         rng (Optional[torch.Generator], optional): Random state. Defaults to None.
 
-        Returns:
-            ts: Updated MVEventData with new events appended.
-            time_samples: List of sampled inter-arrival times.
-            dist_samples: List of type probability distributions at each sampled time.
-        """
-        if rng is None:
-            rng = torch.Generator(device=self.h_knots.device)
-        elif isinstance(rng, int):
-            rng = torch.Generator(device=self.h_knots.device).manual_seed(rng)
+    #     Returns:
+    #         ts: Updated MVEventData with new events appended.
+    #         time_samples: List of sampled inter-arrival times.
+    #         dist_samples: List of type probability distributions at each sampled time.
+    #     """
+    #     if rng is None:
+    #         rng = torch.Generator(device=self.h_knots.device)
+    #     elif isinstance(rng, int):
+    #         rng = torch.Generator(device=self.h_knots.device).manual_seed(rng)
 
-        curr_ts = ts  # (N,) can be None
-        (h,) = self.get_heights()  # (D, K) - unpack from tuple
-        device = h.device
+    #     curr_ts = ts  # (N,) can be None
+    #     (h,) = self.get_heights()  # (D, K) - unpack from tuple
+    #     device = h.device
 
-        time_samples = []
-        dist_samples = []
+    #     time_samples = []
+    #     dist_samples = []
 
-        # Build the marginal intensity by summing across dimensions
-        # h_marginal[k] = sum_d h[d, k]
-        h_marginal = h.sum(dim=0, keepdim=True)  # (1, K)
+    #     # Build the marginal intensity by summing across dimensions
+    #     # h_marginal[k] = sum_d h[d, k]
+    #     h_marginal = h.sum(dim=0, keepdim=True)  # (1, K)
 
-        for step in range(num_steps):
-            t_start = curr_ts.time_points.max() if curr_ts.time_points.numel() > 0 else torch.tensor(0.0, device=device)
+    #     for step in range(num_steps):
+    #         t_start = curr_ts.time_points.max() if curr_ts.time_points.numel() > 0 else torch.tensor(0.0, device=device)
 
-            # Compute cumulative intensity of marginal process at t_start
-            # Lambda_marginal(t) = sum_d Lambda_d(t) = integral of sum_d lambda_d(s) from 0 to t
-            if t_start > 0:
-                Lambda_start = LinearSpline.integrate(self.knot_locs, h_marginal, t_start.unsqueeze(0))  # (1, 1)
-                Lambda_start = Lambda_start.squeeze()  # scalar
-            else:
-                Lambda_start = torch.tensor(0.0, device=device)
+    #         # Compute cumulative intensity of marginal process at t_start
+    #         # Lambda_marginal(t) = sum_d Lambda_d(t) = integral of sum_d lambda_d(s) from 0 to t
+    #         if t_start > 0:
+    #             Lambda_start = LinearSpline.integrate(self.knot_locs, h_marginal, t_start.unsqueeze(0))  # (1, 1)
+    #             Lambda_start = Lambda_start.squeeze()  # scalar
+    #         else:
+    #             Lambda_start = torch.tensor(0.0, device=device)
 
-            # Sample u ~ Uniform(0, 1) and compute inverse of target cumulative intensity
-            # u = 1 - exp(-(Lambda_target - Lambda_start)) => CDF inversion
-            # 1 -u = exp(-(Lambda_target - Lambda_start)) => -log(1-u) = Lambda_target - Lambda_start
-            u = torch.rand(size=(), generator=rng, device=device)
-            Lambda_target = Lambda_start - torch.log(1 - u)
+    #         # Sample u ~ Uniform(0, 1) and compute inverse of target cumulative intensity
+    #         # u = 1 - exp(-(Lambda_target - Lambda_start)) => CDF inversion
+    #         # 1 -u = exp(-(Lambda_target - Lambda_start)) => -log(1-u) = Lambda_target - Lambda_start
+    #         u = torch.rand(size=(), generator=rng, device=device)
+    #         Lambda_target = Lambda_start - torch.log(1 - u)
 
-            # Invert: find t such that Lambda_marginal(t) = Lambda_target
-            t_next = LinearSpline.inverse_integral(
-                self.knot_locs,
-                h_marginal,
-                Lambda_target.unsqueeze(0).unsqueeze(0),  # (1, 1)
-            )  # (1, 1)
-            t_next = t_next.squeeze()  # scalar
+    #         # Invert: find t such that Lambda_marginal(t) = Lambda_target
+    #         t_next = LinearSpline.inverse_integral(
+    #             self.knot_locs,
+    #             h_marginal,
+    #             Lambda_target.unsqueeze(0).unsqueeze(0),  # (1, 1)
+    #         )  # (1, 1)
+    #         t_next = t_next.squeeze()  # scalar
 
-            # Compute inter-arrival time
-            delta_t = t_next - t_start
-            time_samples.append(delta_t.item())
+    #         # Compute inter-arrival time
+    #         delta_t = t_next - t_start
+    #         time_samples.append(delta_t.item())
 
-            # Determine event type: sample from categorical weighted by intensities at t_next
-            intensities_at_t = LinearSpline.interpolate(self.knot_locs, h, t_next.unsqueeze(0))  # (1, D)
-            intensities_at_t = intensities_at_t.squeeze(0)  # (D,)
+    #         # Determine event type: sample from categorical weighted by intensities at t_next
+    #         intensities_at_t = LinearSpline.interpolate(self.knot_locs, h, t_next.unsqueeze(0))  # (1, D)
+    #         intensities_at_t = intensities_at_t.squeeze(0)  # (D,)
 
-            # Normalize to get probabilities
-            probs = intensities_at_t / intensities_at_t.sum()
-            dist_samples.append(probs.detach().clone())
+    #         # Normalize to get probabilities
+    #         probs = intensities_at_t / intensities_at_t.sum()
+    #         dist_samples.append(probs.detach().clone())
 
-            # Sample event type
-            event_type = torch.multinomial(probs, num_samples=1, generator=rng)  # (1,)
+    #         # Sample event type
+    #         event_type = torch.multinomial(probs, num_samples=1, generator=rng)  # (1,)
 
-            # Append new event to sequence
-            new_time_points = torch.cat([curr_ts.time_points, t_next.unsqueeze(0)], dim=0)
-            new_event_types = torch.cat([curr_ts.event_types, event_type], dim=0)
+    #         # Append new event to sequence
+    #         new_time_points = torch.cat([curr_ts.time_points, t_next.unsqueeze(0)], dim=0)
+    #         new_event_types = torch.cat([curr_ts.event_types, event_type], dim=0)
 
-            curr_ts = MVEventData(new_time_points, new_event_types)
+    #         curr_ts = MVEventData(new_time_points, new_event_types)
 
-        return curr_ts, time_samples, dist_samples
+    #     return curr_ts, time_samples, dist_samples

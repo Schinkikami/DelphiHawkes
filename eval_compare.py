@@ -5,19 +5,18 @@ import numpy as np
 import torch
 import tqdm
 
-from hawkes.hawkes.baseline import ConditionalInhomogeniousPoissonProcess
 
 # Ensure local package imports in `hawkes/` resolve correctly when running as a script
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from hawkes.hawkes.baseline import PoissonProcess
+from hawkes.hawkes.hawkes_tpp import SplineBaselineExpKernelHawkesProcess
+from hawkes.hawkes.tpps import TemporalPointProcess
 from utils import get_p2i, get_batch
 from model import Delphi, DelphiConfig
 
 from hawkes.hawkes.ukb_loading import load_ukb_sequences
 from hawkes.hawkes.event_utils import BatchedMVEventData
-from hawkes.hawkes.Hawkes import ExpKernelMVHawkesProcess
 
 
 def evaluate_delphi(ckpt_path: Path, data_dir: Path, device: str = "cpu", max_batches: int = 50):
@@ -100,7 +99,7 @@ def evaluate_delphi(ckpt_path: Path, data_dir: Path, device: str = "cpu", max_ba
             rate_sum = rates.sum(dim=2)
             probs = rates / rate_sum.unsqueeze(-1)
 
-            # P(E=e| T=t, H_t) => P(E=e| H_t), as we constant (t independent) constant intensities.
+            # P(E=e| T=t, H_t) => P(E=e| H_t), as we have constant (t independent) intensities.
             type_likelihoods = torch.take_along_dim(probs, Y.unsqueeze(-1), dim=2).squeeze(
                 2
             )  # At t, as it is constant over time.
@@ -155,27 +154,22 @@ def evaluate_delphi(ckpt_path: Path, data_dir: Path, device: str = "cpu", max_ba
     return likelihood_metrics
 
 
-def evaluate_hawkes(hawkes_state_path: Path | None, expansion_path: Path, device: str = "cpu", max_seqs: int = 2000):
+def evaluate_tpp(model: TemporalPointProcess, sequences, D, device: str = "cpu", max_seqs: int = 2000):
     # Load sequences using ukb_loading
-    sequences, sexes, num_event_types = load_ukb_sequences(expansion_path, limit_size=max_seqs)
 
-    D = int(num_event_types)
-    if hawkes_state_path is not None and hawkes_state_path.exists():
-        # need to know D to instantiate
-        hawkes = ExpKernelMVHawkesProcess(None, D).to(device)
-        state = torch.load(str(hawkes_state_path), map_location=device)
-        hawkes.load_state_dict(state)
-    else:
-        raise RuntimeError("Hawkes- Checkpoint not found!")
-
-    hawkes.eval()
+    model.eval()
 
     DEVICE = torch.device("cuda:0")
-    hawkes = hawkes.to(DEVICE)
+    model = model.to(DEVICE)
 
     joint_likelihood = []
     time_likelihood = []
-    type_time_cond_likelihood = []
+    time_cond_type_likelihood = []
+    marginal_type_likelihood = []
+    accuracy = []
+    time_squared_errors = []
+    time_abs_errors = []
+
     num_sequences = 0
     total_predictions = 0
 
@@ -201,23 +195,29 @@ def evaluate_hawkes(hawkes_state_path: Path | None, expansion_path: Path, device
             # Evaluate likelihoods and so on here.
 
             # First the per-type intensities and probabilities.
-            type_intensity_at_t = hawkes.intensity(target_time, batch)
-            type_cumulative_intensity_t = hawkes.cumulative_intensity(target_time, batch) - hawkes.cumulative_intensity(
+            type_intensity_at_t = model.intensity(target_time, batch)
+            type_cumulative_intensity_t = model.cumulative_intensity(target_time, batch) - model.cumulative_intensity(
                 last_time, batch
             )
 
             # Joint density p(t,e). The likelihoods for all event types at the correct time (but not conditioned!!)
-            type_PDF_at_t = hawkes.PDF(target_time, batch)
+            type_PDF_at_t = model.PDF(target_time, batch)
 
             # The likelihood of the correct event type at the correct time
             joint_likelihood_at_t = type_PDF_at_t[torch.arange(len(history)), target_type]
             joint_likelihood.append(joint_likelihood_at_t[valid_targets] / (365 * 80))
 
-            # Distribution over types at time_point t.
+            # Distribution over types at time_point t, conditioned on time: p(m | t, H_t)
             type_distribution_at_t = type_intensity_at_t / torch.sum(type_intensity_at_t, dim=1).unsqueeze(1)
-            type_time_cond_likelihood.append(
+            time_cond_type_likelihood.append(
                 type_distribution_at_t[torch.arange(len(history)), target_type][valid_targets]
             )
+
+            # Marginal type likelihood p(m | H_t) - marginalizing over time
+            # Uses numerical integration from base class
+            marginal_type_probs = model.marginal_class_distribution(batch)  # (B, D)
+            marginal_type_likelihood_at_target = marginal_type_probs[torch.arange(len(history)), target_type]
+            marginal_type_likelihood.append(marginal_type_likelihood_at_target[valid_targets])
 
             # Often TPPs are compared on next event prediction quality. We define the intensities and likelihoods for the next events.
             total_intensity_at_t = torch.sum(type_intensity_at_t, dim=1)
@@ -226,225 +226,24 @@ def evaluate_hawkes(hawkes_state_path: Path | None, expansion_path: Path, device
             total_PDF_at_t = total_intensity_at_t * torch.exp(-total_cumulative_intensity_at_t)
             time_likelihood.append(total_PDF_at_t[valid_targets] / (365 * 80))
 
-            # The expected value of the time_pdf. Often used for L2 and L1 metrics.
-            # expected_t_given_history = None  # Hard to compute?? We can evaluate the PDF like above. But computing the mean requires sampling I think?
-            # median_t_given_history = None  # We could probably compute the median of the pdf (and then use abs error as metric), using the inverse of the CDF, as computed in the inverse sampling...
+            # Compute median time prediction using inverse CDF at u=0.5
+            # median_t = inverse_CDF(0.5) gives us the time where P(t_next < median_t | H_t) = 0.5
+            u_median = torch.full((len(history),), 0.5, device=DEVICE, dtype=torch.float64)
+            median_time_pred = model.inverse_CDF(u_median, batch)  # (B,)
 
-            # Sample multiple continuatations.
-            # samples = [hawkes.sample_inverse(ts, num_steps=1) for _ in range(100)]
-            # sample_times = [s[1] for s in samples]
-            # sample_type_dists = [s[2] for s in samples]
-
-            # Estimate for the expected next event time.
-            # average_time = torch.mean(sample_times, dim=0)
-
-            # Estimate for the distribution over event types of next token.
-            # average_sample_dist = torch.mean(sample_type_dists, dim=0)
-
-            # We need to implement metrics here.
+            # Compute time prediction errors (RMSE and MAE)
+            time_errors = (median_time_pred - target_time)[valid_targets]
+            time_squared_errors.append(time_errors**2)
+            time_abs_errors.append(torch.abs(time_errors))
 
     metrics = {
-        "Marginal time-likelihood": torch.mean(torch.log(torch.cat(time_likelihood))),
-        "Conditional type-likelihood": torch.mean(torch.log(torch.cat(type_time_cond_likelihood))),
-        "Joint likelihood": torch.mean(torch.log(torch.cat(joint_likelihood))),
+        "Marginal time-log-likelihood": torch.mean(torch.log(torch.cat(time_likelihood))),
+        "Conditional type-log-likelihood (p(m|t,H))": torch.mean(torch.log(torch.cat(time_cond_type_likelihood))),
+        "Marginal type-log-likelihood (p(m|H))": torch.mean(torch.log(torch.cat(marginal_type_likelihood))),
+        "Joint log-likelihood": torch.mean(torch.log(torch.cat(joint_likelihood))),
+        "Time RMSE (median pred)": torch.sqrt(torch.mean(torch.cat(time_squared_errors))),
+        "Time MAE (median pred)": torch.mean(torch.cat(time_abs_errors)),
     }
-    print("Hawkes metrics:", metrics)
-    return metrics
-
-
-def evaluate_poisson(poisson_state_path: Path | None, expansion_path: Path, device: str = "cpu", max_seqs: int = 2000):
-    # Load sequences using ukb_loading
-    sequences, sexes, num_event_types = load_ukb_sequences(expansion_path, limit_size=max_seqs)
-
-    D = int(num_event_types)
-    if poisson_state_path is not None and poisson_state_path.exists():
-        # need to know D to instantiate
-        poisson = PoissonProcess(None, D).to(device)
-        state = torch.load(str(poisson_state_path), map_location=device)
-        poisson.load_state_dict(state)
-    else:
-        raise RuntimeError("Poisson- Checkpoint not found!")
-
-    poisson.eval()
-
-    DEVICE = torch.device("cuda:0")
-    poisson = poisson.to(DEVICE)
-
-    joint_likelihood = []
-    time_likelihood = []
-    type_time_cond_likelihood = []
-    num_sequences = 0
-    total_predictions = 0
-
-    for ts_all in tqdm.tqdm(sequences):
-        if len(ts_all) < 3:
-            continue
-
-        num_sequences += 1
-
-        history = [
-            ts_all[: idx - 1] for idx in range(2, len(ts_all))
-        ]  # TODO need fix this bug, we cant run from empty sequences in batch mode..
-        batch = BatchedMVEventData(mv_events=history)
-        target_time = ts_all.time_points[2:].to(DEVICE)
-        target_type = ts_all.event_types[2:].to(DEVICE)
-        total_predictions += len(target_time)
-        last_time = batch.max_time.to(DEVICE)
-        batch = batch.to(DEVICE)
-
-        valid_targets = target_type >= 11  # Here we dont have padding and no-event tokens at 0 and 1.
-
-        with torch.no_grad():
-            # Evaluate likelihoods and so on here.
-
-            # First the per-type intensities and probabilities.
-            type_intensity_at_t = poisson.intensity(target_time, batch)
-            type_cumulative_intensity_t = poisson.cumulative_intensity(
-                target_time, batch
-            ) - poisson.cumulative_intensity(last_time, batch)
-
-            # Joint density p(t,e). The likelihoods for all event types at the correct time (but not conditioned!!)
-            type_PDF_at_t = poisson.PDF(target_time, batch)
-
-            # The likelihood of the correct event type at the correct time
-            joint_likelihood_at_t = type_PDF_at_t[torch.arange(len(history)), target_type]
-            joint_likelihood.append(joint_likelihood_at_t[valid_targets] / (365 * 80))
-
-            # Distribution over types at time_point t.
-            type_distribution_at_t = type_intensity_at_t / torch.sum(type_intensity_at_t, dim=1).unsqueeze(1)
-            type_time_cond_likelihood.append(
-                type_distribution_at_t[torch.arange(len(history)), target_type][valid_targets]
-            )
-
-            # Often TPPs are compared on next event prediction quality. We define the intensities and likelihoods for the next events.
-            total_intensity_at_t = torch.sum(type_intensity_at_t, dim=1)
-            total_cumulative_intensity_at_t = torch.sum(type_cumulative_intensity_t, dim=1)
-            total_CDF_at_t = 1 - torch.exp(-total_cumulative_intensity_at_t)
-            total_PDF_at_t = total_intensity_at_t * torch.exp(-total_cumulative_intensity_at_t)
-            time_likelihood.append(total_PDF_at_t[valid_targets] / (365 * 80))
-
-            # The expected value of the time_pdf. Often used for L2 and L1 metrics.
-            # expected_t_given_history = None  # Hard to compute?? We can evaluate the PDF like above. But computing the mean requires sampling I think?
-            # median_t_given_history = None  # We could probably compute the median of the pdf (and then use abs error as metric), using the inverse of the CDF, as computed in the inverse sampling...
-
-            # Sample multiple continuatations.
-            # samples = [hawkes.sample_inverse(ts, num_steps=1) for _ in range(100)]
-            # sample_times = [s[1] for s in samples]
-            # sample_type_dists = [s[2] for s in samples]
-
-            # Estimate for the expected next event time.
-            # average_time = torch.mean(sample_times, dim=0)
-
-            # Estimate for the distribution over event types of next token.
-            # average_sample_dist = torch.mean(sample_type_dists, dim=0)
-
-            # We need to implement metrics here.
-
-    metrics = {
-        "Marginal time-likelihood": torch.mean(torch.log(torch.cat(time_likelihood))),
-        "Conditional type-likelihood": torch.mean(torch.log(torch.cat(type_time_cond_likelihood))),
-        "Joint likelihood": torch.mean(torch.log(torch.cat(joint_likelihood))),
-    }
-    print("Poisson metrics:", metrics)
-    return metrics
-
-
-def evaluate_inh_poisson(
-    poisson_state_path: Path | None, expansion_path: Path, device: str = "cpu", max_seqs: int = 2000
-):
-    # Load sequences using ukb_loading
-    sequences, sexes, num_event_types = load_ukb_sequences(expansion_path, limit_size=max_seqs)
-
-    D = int(num_event_types)
-    if poisson_state_path is not None and poisson_state_path.exists():
-        # need to know D to instantiate
-        poisson = ConditionalInhomogeniousPoissonProcess(None, D).to(device)
-        state = torch.load(str(poisson_state_path), map_location=device)
-        poisson.load_state_dict(state)
-    else:
-        raise RuntimeError("Poisson- Checkpoint not found!")
-
-    poisson.eval()
-
-    DEVICE = torch.device("cuda:0")
-    poisson = poisson.to(DEVICE)
-
-    joint_likelihood = []
-    time_likelihood = []
-    type_time_cond_likelihood = []
-    num_sequences = 0
-    total_predictions = 0
-
-    for ts_all in tqdm.tqdm(sequences):
-        if len(ts_all) < 3:
-            continue
-
-        num_sequences += 1
-
-        history = [
-            ts_all[: idx - 1] for idx in range(2, len(ts_all))
-        ]  # TODO need fix this bug, we cant run from empty sequences in batch mode..
-        batch = BatchedMVEventData(mv_events=history)
-        target_time = ts_all.time_points[2:].to(DEVICE)
-        target_type = ts_all.event_types[2:].to(DEVICE)
-        total_predictions += len(target_time)
-        last_time = batch.max_time.to(DEVICE)
-        batch = batch.to(DEVICE)
-
-        valid_targets = target_type >= 11  # Here we dont have padding and no-event tokens at 0 and 1.
-
-        with torch.no_grad():
-            # Evaluate likelihoods and so on here.
-
-            # First the per-type intensities and probabilities.
-            type_intensity_at_t = poisson.intensity(target_time, batch)
-            type_cumulative_intensity_t = poisson.cumulative_intensity(
-                target_time, batch
-            ) - poisson.cumulative_intensity(last_time, batch)
-
-            # Joint density p(t,e). The likelihoods for all event types at the correct time (but not conditioned!!)
-            type_PDF_at_t = poisson.PDF(target_time, batch)
-
-            # The likelihood of the correct event type at the correct time
-            joint_likelihood_at_t = type_PDF_at_t[torch.arange(len(history)), target_type]
-            joint_likelihood.append(joint_likelihood_at_t[valid_targets] / (365 * 80))
-
-            # Distribution over types at time_point t.
-            type_distribution_at_t = type_intensity_at_t / torch.sum(type_intensity_at_t, dim=1).unsqueeze(1)
-            type_time_cond_likelihood.append(
-                type_distribution_at_t[torch.arange(len(history)), target_type][valid_targets]
-            )
-
-            # Often TPPs are compared on next event prediction quality. We define the intensities and likelihoods for the next events.
-            total_intensity_at_t = torch.sum(type_intensity_at_t, dim=1)
-            total_cumulative_intensity_at_t = torch.sum(type_cumulative_intensity_t, dim=1)
-            total_CDF_at_t = 1 - torch.exp(-total_cumulative_intensity_at_t)
-            total_PDF_at_t = total_intensity_at_t * torch.exp(-total_cumulative_intensity_at_t)
-            time_likelihood.append(total_PDF_at_t[valid_targets] / (365 * 80))
-
-            # The expected value of the time_pdf. Often used for L2 and L1 metrics.
-            # expected_t_given_history = None  # Hard to compute?? We can evaluate the PDF like above. But computing the mean requires sampling I think?
-            # median_t_given_history = None  # We could probably compute the median of the pdf (and then use abs error as metric), using the inverse of the CDF, as computed in the inverse sampling...
-
-            # Sample multiple continuatations.
-            # samples = [hawkes.sample_inverse(ts, num_steps=1) for _ in range(100)]
-            # sample_times = [s[1] for s in samples]
-            # sample_type_dists = [s[2] for s in samples]
-
-            # Estimate for the expected next event time.
-            # average_time = torch.mean(sample_times, dim=0)
-
-            # Estimate for the distribution over event types of next token.
-            # average_sample_dist = torch.mean(sample_type_dists, dim=0)
-
-            # We need to implement metrics here.
-
-    metrics = {
-        "Marginal time-likelihood": torch.mean(torch.log(torch.cat(time_likelihood))),
-        "Conditional type-likelihood": torch.mean(torch.log(torch.cat(type_time_cond_likelihood))),
-        "Joint likelihood": torch.mean(torch.log(torch.cat(joint_likelihood))),
-    }
-    print("InhomogeniousPoisson metrics:", metrics)
     return metrics
 
 
@@ -452,47 +251,66 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--delphi_ckpt", type=str, default="models/ckpt.pt", help="Path to Delphi ckpt")
     parser.add_argument(
-        "--hawkes_state", type=str, default="models/hawkes_trained.pth", help="Path to Hawkes state dict (optional)"
+        "--hawkes_state", type=str, default="models/new_hawkes.pth", help="Path to Hawkes state dict (optional)"
     )  #
     parser.add_argument(
-        "--poisson_state", type=str, default="models/poisson_trained.pth", help="Path to Poisson state dict (optional)"
+        "--poisson_state",
+        type=str,
+        default="models/new_poisson_trained.pth",
+        help="Path to Poisson state dict (optional)",
     )
     parser.add_argument(
         "--inh_poisson_state",
         type=str,
-        default="models/cond_inh_poisson_trained.pth",
+        default="models/new_cond_inh_poisson_trained.pth",
         help="Path to Inhomogenious Poisson state dict (optional)",
     )
 
     parser.add_argument(
         "--spline_poisson_state",
         type=str,
-        default="models/spline_poisson_trained.pth",
+        default="models/new_spline_poisson_trained.pth",
         help="Path to Spline Poisson state dict (optional)",
+    )
+
+    parser.add_argument(
+        "--spline_exp_hawkes_state",
+        type=str,
+        default="models/new_spline_hawkes.pth",
+        help="Path to Spline Exp Hawkes state dict (optional)",
     )
     parser.add_argument("--data_dir", type=str, default="data/ukb_simulated_data", help="Path to ukb data dir")
     parser.add_argument(
         "--expansion_bin", type=str, default="data/ukb_simulated_data/test.bin", help="Expansion bin for Hawkes"
     )
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     expansion = Path(args.expansion_bin)
 
-    print("Evaluating Delphi...")
-    evaluate_delphi(Path(args.delphi_ckpt), data_dir, device=args.device)
+    sequences, sexes, num_event_types = load_ukb_sequences(expansion, limit_size=10000)
 
-    print("Evaluating Hawkes...")
-    evaluate_hawkes(Path(args.hawkes_state) if args.hawkes_state else None, expansion, device=args.device)
+    D = num_event_types  # Number of event types in UKB data
 
-    print("Evaluating Poisson...")
-    evaluate_poisson(Path(args.poisson_state) if args.poisson_state else None, expansion, device=args.device)
+    # print("Evaluating Delphi...")
+    # evaluate_delphi(Path(args.delphi_ckpt), data_dir, device=args.device)
 
-    print("Evaluating Inhomogenious Poisson...")
-    evaluate_inh_poisson(
-        Path(args.inh_poisson_state) if args.inh_poisson_state else None, expansion, device=args.device
-    )
+    # print("Evaluating Hawkes...")
+    # model = ExpKernelHawkesProcess(
+    #    D,
+    # ).to(args.device)
+    # state = torch.load(f=str(args.hawkes_state), map_location=args.device)
+    # model.load_state_dict(state)
+
+    # print(evaluate_tpp(model, sequences, num_event_types, device=args.device))
+
+    print("Evaluating SplineExpHawkes...")
+    model = SplineBaselineExpKernelHawkesProcess(D, 5, 0.3).to(args.device)
+    state = torch.load(f=str(args.spline_exp_hawkes_state), map_location=args.device)
+    model.load_state_dict(state)
+
+    print(evaluate_tpp(model, sequences, num_event_types, device=args.device))
 
 
 if __name__ == "__main__":

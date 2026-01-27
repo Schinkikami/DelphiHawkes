@@ -19,7 +19,13 @@ from hawkes.baseline_tpps import (
     ConditionalInhomogeniousPoissonProcess,
     SplinePoissonProcess,
 )
-from hawkes.hawkes_tpp import ExpKernelHawkesProcess, SplineBaselineExpKernelHawkesProcess
+from hawkes.hawkes_tpp import (
+    ExpKernelHawkesProcess,
+    LinearBaselineExpKernelHawkesProcess,
+    SplineBaselineExpKernelHawkesProcess,
+    SoftplusConstExpIHawkesProcess,
+    NumericalSplineBaselineExpKernelHawkesProcess,
+)
 from hawkes.ukb_loading import load_ukb_sequences
 # %%
 
@@ -48,13 +54,13 @@ class TrainingConfig:
         "hawkes_modular"  # "poisson", "inhomogeneous_poisson", "spline_poisson", "hawkes", "hawkes_modular"
     )
     model_seed: int = 43
-
+    num_ci_integration_steps: int = 10
     # Spline-specific settings (for spline_poisson)
     spline_K: int = 5  # Number of knots
     spline_delta_t: float = 0.3  # Time spacing (default: 1.5/5)
 
     # Device settings
-    device: str = "cuda:0"
+    device: str = "cpu"
 
     # Weights & Biases settings
     wandb_enable: bool = False  # Set True to enable W&B logging
@@ -82,7 +88,7 @@ def measure_likelihood(model: TemporalPointProcess, dataloader: DataLoader, devi
 
     lls = []
 
-    for batch in dataloader:
+    for batch in tqdm(dataloader):
         T = batch.max_time
         batch = batch.to(device)
         T = T.to(device)
@@ -207,15 +213,16 @@ config = TrainingConfig(
     scheduler_step_size=100,  # For step scheduler
     scheduler_gamma=0.1,  # For step scheduler
     # Model settings
-    model_type="spline_exp_hawkes",  # Options: "poisson", "inhomogeneous_poisson", "spline_poisson", "hawkes", "spline_exp_hawkes"
+    model_type="soft_plus_const_exp_ihawkes",  # Options: "numerical_spline_exp_hawkes","poisson", "inhomogeneous_poisson", "spline_poisson", "hawkes", "linear_exp_hawkes", "spline_exp_hawkes"
     model_seed=43,
+    num_ci_integration_steps=10,
     # Spline-specific settings (only used for spline_poisson)
     spline_K=5,
-    spline_delta_t=0.3,  # Time spacing for splines
+    spline_delta_t=1.5 / 5,  # Time spacing for splines
     # Device settings
-    device="cuda:0",
+    device="cpu",
     # Weights & Biases settings
-    wandb_enable=True,  # Set False to disable logging
+    wandb_enable=False,  # Set False to disable logging
     wandb_project="tpp-compare",  # Fill in your project name
     wandb_entity=None,  # Fill in your team/entity name if needed
     wandb_run_name=None,  # Auto-set to model_type if None
@@ -362,8 +369,18 @@ elif config.model_type == "hawkes":
         model = ExpKernelHawkesProcess(D=D, seed=config.model_seed)
     save_filename = "hawkes.pth"
 
+elif config.model_type == "linear_exp_hawkes":
+    print("Creating new linear baseline exponential kernel Hawkes Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = LinearBaselineExpKernelHawkesProcess(D=D, seed=config.model_seed)
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = LinearBaselineExpKernelHawkesProcess(D=D, seed=config.model_seed)
+    save_filename = "linear_exp_hawkes.pth"
+
 elif config.model_type == "spline_exp_hawkes":
-    print("Creating new modular Exponential Kernel Hawkes Process model...")
+    print("Creating new spline baseline exponential kernel Hawkes Process model...")
     if load_path is not None and load_path.exists():
         print("Loading pre-trained model...")
         model = SplineBaselineExpKernelHawkesProcess(
@@ -376,6 +393,40 @@ elif config.model_type == "spline_exp_hawkes":
         )
     save_filename = "spline_hawkes.pth"
 
+elif config.model_type == "soft_plus_const_exp_ihawkes":
+    print("Creating new softplus const exp inhibitive Hawkes Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = SoftplusConstExpIHawkesProcess(
+            D=D,
+            seed=config.model_seed,
+            baseline_params=None,
+            kernel_params=None,
+        )
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = SoftplusConstExpIHawkesProcess(
+            D=D,
+            seed=config.model_seed,
+            baseline_params=None,
+            kernel_params=None,
+        )
+    model.ci_num_points = config.num_ci_integration_steps
+    save_filename = "softplus_const_exp_ihawkes.pth"
+
+elif config.model_type == "numerical_spline_exp_hawkes":
+    print("Creating new numerical spline baseline exponential kernel Hawkes Process model...")
+    if load_path is not None and load_path.exists():
+        print("Loading pre-trained model...")
+        model = NumericalSplineBaselineExpKernelHawkesProcess(
+            D=D, num_knots=config.spline_K, delta_t=config.spline_delta_t, seed=config.model_seed
+        )
+        model.load_state_dict(torch.load(str(load_path)))
+    else:
+        model = NumericalSplineBaselineExpKernelHawkesProcess(
+            D=D, num_knots=config.spline_K, delta_t=config.spline_delta_t, seed=config.model_seed
+        )
+    save_filename = "numerical_spline_hawkes.pth"
 else:
     raise ValueError(
         f"Unknown model type: {config.model_type}. Choose from: poisson, inhomogeneous_poisson, spline_poisson, hawkes"

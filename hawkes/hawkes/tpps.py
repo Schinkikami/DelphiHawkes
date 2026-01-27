@@ -179,10 +179,10 @@ class TemporalPointProcess(nn.Module, ABC):
             ts=ts,
             method=self.ci_integration_method,
             num_points=self.ci_num_points,
-            rng=self.generator,
+            rng=None,
         )
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData, use_analytical_ci: Optional[bool] = True):
+    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData, use_analytical_ci: Optional[bool] = None):
         """
         Compute the cumulative intensity function Λ_d(T).
 
@@ -209,7 +209,7 @@ class TemporalPointProcess(nn.Module, ABC):
 
     # ========================================================================
     # CDF/CI Inversion (Override for analytical solution)
-    # =======================================================================
+    # ========================================================================
 
     def inverse_marginal_cumulative_intensity(
         self,
@@ -217,7 +217,7 @@ class TemporalPointProcess(nn.Module, ABC):
         ts: BatchedMVEventData,
     ) -> torch.Tensor:
         """
-        Invert the marginal cumulative intensity to find t such that Λ(t) - Λ(t_last) = u.
+        Invert the marginal cumulative intensity to find t such that Λ(t) = u.
         t is here in absolute time.
 
         Default implementation: Uses Bracketed-Newton's method from utils.py.
@@ -228,7 +228,7 @@ class TemporalPointProcess(nn.Module, ABC):
             ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
 
         Returns:
-            Time values delta such that cumulative_intensity(delta) ≈ u. Shape: same as u
+            Time values t such that cumulative_intensity(t) ≈ u. Shape: same as u
 
         Useful for sampling and other applications requiring CI inversion.
         """
@@ -237,11 +237,9 @@ class TemporalPointProcess(nn.Module, ABC):
 
         device = ts.time_points.device
 
-        last_event_CI = self.cumulative_intensity(ts.max_time, ts)  # (B,D)
-
         def ci_func(t: torch.Tensor) -> torch.Tensor:
             ci = self.cumulative_intensity(t, ts)  # (B,D)
-            return ci.sum(dim=1) - last_event_CI.sum(dim=1)  # (B,)
+            return ci.sum(dim=1)  # (B,)
 
         def intensity_func(t: torch.Tensor) -> torch.Tensor:
             lam = self.intensity(t, ts)  # (B,D)
@@ -253,6 +251,36 @@ class TemporalPointProcess(nn.Module, ABC):
             target=u,
             bracket_init=(ts.max_time, ts.max_time + 0.1),
         )
+
+        return t_star
+
+    def inverse_CDF(self, u: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """
+        Invert the CDF to find T such that P( t_next < T) = u.
+        Also known as the quantile function. It is only defined for T >= last event time.
+        If you want to sample inbetween events, use the inverse_marginal_cumulative_intensity function,
+        or cut of the history ts.
+
+
+        Uses the inverse marginal cumulative intensity.
+        Args:
+            u: Target CDF values. Shape: (batch_size,)
+            ts: Historical events. Shape: (batch_size, seq_len)
+
+        Returns:
+            Time values T such that CDF(T) ≈ u. Shape: same as u
+
+        Useful for sampling and other applications requiring CDF inversion.
+        """
+        device = ts.time_points.device
+
+        # Transform u to target cumulative intensity
+        target_ci = -torch.log1p(-u).to(device)  # (B,)
+
+        # CDF is only defined for t >= last event time
+        target_ci += self.cumulative_intensity(ts.max_time, ts).sum(dim=1)  # (B,)
+
+        t_star = self.inverse_marginal_cumulative_intensity(target_ci, ts)  # (B,)
 
         return t_star
 
@@ -404,6 +432,15 @@ class TemporalPointProcess(nn.Module, ABC):
             This is the probability density for the joint distribution over (time, type).
             To get marginal over time: sum over all types.
         """
+        # Convert T to double to match ts.max_time dtype
+        T = T.double()
+
+        # If T is very close to ts.max_time, round up to avoid numerical issues
+        close_mask = torch.abs(T - ts.max_time) < 1e-8
+        T = torch.where(close_mask, ts.max_time, T)
+
+        assert (T >= ts.max_time).all(), "PDF is only defined for T >= last event time."
+
         intensities = self.intensity(T, ts)  # Shape: (B, D)
         ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B, D)
         pdfs = intensities * torch.exp(-torch.sum(ci, dim=1, keepdim=True))  # Shape: (B, D)
@@ -431,9 +468,113 @@ class TemporalPointProcess(nn.Module, ABC):
             CDF for the categorical event type is not well-defined. This returns the
             marginal CDF over time, integrating out the event type.
         """
+        # Convert T to double to match ts.max_time dtype
+        T = T.double()
+
+        # If T is very close to ts.max_time, round up to avoid numerical issues
+        close_mask = torch.abs(T - ts.max_time) < 1e-6
+        T = torch.where(close_mask, ts.max_time, T)
+
+        assert (T >= ts.max_time).all(), "CDF is only defined for T >= last event time."
+
         ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B, D)
         cdfs = 1 - torch.exp(-torch.sum(ci, dim=1))  # Shape: (B,)
         return cdfs
+
+    def marginal_class_distribution(
+        self,
+        ts: BatchedMVEventData,
+        T_max: Optional[torch.Tensor] = None,
+        num_points: int = 200,
+    ) -> torch.Tensor:
+        """
+        Compute the marginal class distribution p(m | H_t) for the next event.
+
+        This marginalizes over time to get the probability of each event type
+        for the next event, regardless of when it occurs:
+
+            p(m | H_t) = ∫_{t_N}^{∞} p(m, s | H_t) ds
+                       = ∫_{t_N}^{∞} λ_m(s) exp(-∑_d (Λ_d(s) - Λ_d(t_N))) ds
+
+        Since we cannot integrate to infinity, we integrate up to T_max where
+        the survival probability is negligible (CDF ≈ 1).
+
+        Args:
+            ts: Historical events (batched, padded). Shape: (batch_size, seq_len)
+            T_max: Upper integration limit. Shape: (batch_size,) or None.
+                   If None, automatically determined based on when CDF ≈ 0.999.
+            num_points: Number of quadrature points for numerical integration.
+
+        Returns:
+            Marginal class probabilities for each batch. Shape: (batch_size, D)
+            Each row sums to approximately 1 (may be slightly less if T_max is too small).
+
+        Mathematical derivation:
+            The joint PDF of the next event at time s with type m is:
+                p(s, m | H_t) = λ_m(s) × exp(-∑_d (Λ_d(s) - Λ_d(t_N)))
+
+            Integrating over time gives the marginal over event types:
+                p(m | H_t) = ∫_{t_N}^{∞} λ_m(s) × S(s) ds
+
+            where S(s) = exp(-∑_d (Λ_d(s) - Λ_d(t_N))) is the survival function.
+        """
+        device = ts.time_points.device
+        t_last = ts.max_time  # Shape: (B,)
+
+        # Get baseline cumulative intensity at t_last
+        ci_base = self.cumulative_intensity(t_last, ts)  # Shape: (B, D)
+
+        # Determine T_max if not provided
+        # We want to integrate until CDF ≈ target_cdf (e.g., 0.999)
+        if T_max is None:
+            # Use CDF inversion: CDF(T) = 1 - exp(-Λ(T)) = target_cdf
+            # => Λ(T) = -log(1 - target_cdf)
+            target_cdf = 0.999
+            with torch.no_grad():
+                T_max = self.inverse_CDF(
+                    torch.tensor(target_cdf, device=device).expand(ts.time_points.shape[0]), ts
+                )  # (B,)
+
+        # At this point T_max is guaranteed to be a tensor
+        T_max_tensor: torch.Tensor = T_max
+
+        # Create integration grid: t_last to T_max
+        # Shape: (B, num_points)
+        t_grid = torch.linspace(0, 1, num_points, device=device).unsqueeze(0)  # (1, num_points)
+        t_grid = t_last.unsqueeze(1) + t_grid * (T_max_tensor - t_last).unsqueeze(1)  # (B, num_points)
+
+        # Compute integrand at each grid point
+        # integrand[b, k, d] = λ_d(t_grid[b,k]) * exp(-sum_d' (Λ_d'(t_grid[b,k]) - Λ_d'(t_last[b])))
+        integrands = []
+        for k in range(num_points):
+            t_k = t_grid[:, k]  # (B,)
+
+            # Intensity at t_k
+            lam_k = self.intensity(t_k, ts)  # (B, D)
+
+            # Cumulative intensity at t_k
+            ci_k = self.cumulative_intensity(t_k, ts)  # (B, D)
+
+            # Survival function: exp(-sum_d (Λ_d(t_k) - Λ_d(t_last)))
+            delta_ci = ci_k - ci_base  # (B, D)
+            survival = torch.exp(-delta_ci.sum(dim=1, keepdim=True))  # (B, 1)
+
+            # Integrand: λ_m(t_k) * S(t_k)
+            integrand_k = lam_k * survival  # (B, D)
+            integrands.append(integrand_k)
+
+        # Stack: (B, num_points, D)
+        integrands = torch.stack(integrands, dim=1)
+
+        # Integrate: (B, D)
+        marginal_probs = torch.trapezoid(integrands, t_grid.unsqueeze(-1).expand_as(integrands), dim=1)
+
+        # Normalize to ensure valid probability distribution
+        # (should sum to ~1 if T_max is large enough)
+        total_prob = marginal_probs.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        marginal_probs = marginal_probs / total_prob
+
+        return marginal_probs
 
     # =========================================================================
     # Sampling
@@ -489,10 +630,8 @@ class TemporalPointProcess(nn.Module, ABC):
             # We search for delta such that:
             # CDF(delta) = 1 - exp(- (CI(t_last + delta) - CI(t_last)) ) = u
             # CI(t_last + delta) - CI(t_last) = -log(1-u)
-            target = -torch.log1p(-torch.tensor(u, device=device)).unsqueeze(0)  # (1,)
-
             # Invert CDF to get new event time. The offset with t_last is handled in the inversion implementation.
-            t_star = self.inverse_marginal_cumulative_intensity(target, batched)  # (1,)
+            t_star = self.inverse_CDF(u.unsqueeze(0), batched)  # (1,)
 
             # Sample event type from intensity-weighted categorical
             lam_vec = self.intensity(t_star, batched)[0]  # Shape: (D,)

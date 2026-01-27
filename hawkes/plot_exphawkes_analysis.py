@@ -10,7 +10,6 @@ if project_root not in sys.path:
 import torch
 import matplotlib.pyplot as plt
 from hawkes.event_utils import BatchedMVEventData, MVEventData
-from hawkes.Hawkes import ExpKernelMVHawkesProcess
 
 
 def main():
