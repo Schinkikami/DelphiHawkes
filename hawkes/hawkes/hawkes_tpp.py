@@ -462,6 +462,73 @@ class ConstantBaselineModule(BaselineIntensityModule):
         return mu.unsqueeze(0) * T.unsqueeze(1)  # Shape: (B,D)
 
 
+# UnconstrainedConstantBaselineParams is an alias - same structure, different semantics
+UnconstrainedConstantBaselineParams = ConstantBaselineParams
+
+
+class UnconstrainedConstantBaselineModule(BaselineIntensityModule):
+    """
+    Constant baseline module with unconstrained (real-valued) output.
+
+    For use with InhibitiveHawkesProcess where the positivity constraint
+    (e.g., softplus) is applied to the TOTAL intensity (baseline + kernel),
+    not to individual components.
+
+    This avoids the double-softplus problem where gradients are attenuated.
+    """
+
+    def __init__(self, D: int, params: Optional[ConstantBaselineParams] = None):
+        super().__init__(D)
+
+        if params is None:
+            # Initialize to values that will give reasonable intensities after softplus
+            # softplus(1.0) ≈ 1.31, softplus(0) = 0.69
+            mu = torch.zeros(D)
+        else:
+            mu = params.mu
+            assert mu.shape[0] == D
+
+        # Store directly - no inverse_softplus needed since we don't constrain
+        self.mu = nn.Parameter(mu)
+
+    def transform_params(self) -> Tuple[torch.Tensor]:
+        """Return unconstrained baseline parameters."""
+        return (self.mu,)
+
+    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """
+        Return unconstrained baseline value.
+
+        Note: For inhibitive processes, the positivity constraint is applied
+        at the InhibitiveHawkesProcess level to the total intensity.
+        """
+        (mu,) = self.transform_params()  # Shape: (D,)
+        batch_size = t.shape[0]
+        return mu.unsqueeze(0).expand(batch_size, self.D)  # Shape: (B,D)
+
+    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """
+        Cumulative of unconstrained baseline: mu * T.
+
+        Note: This is only used for diagnostics. The actual negative log-likelihood
+        uses numerical integration of the constrained total intensity.
+        """
+        (mu,) = self.transform_params()  # Shape: (D,)
+        return mu.unsqueeze(0) * T.unsqueeze(1)  # Shape: (B,D)
+
+    def positive_likelihood_intensities(self, ts: BatchedMVEventData) -> torch.Tensor:
+        """Return unconstrained mu at all event times."""
+        valid_events = ts.event_types != -1  # (B, N)
+        (mu,) = self.transform_params()  # (D,)
+
+        # Get mu for the event type at each position
+        clamped_types = ts.event_types.clamp(min=0)  # (B, N)
+        intensities = mu[clamped_types]  # (B, N)
+        intensities = intensities * valid_events.float()
+
+        return intensities  # (B, N)
+
+
 @dataclass
 class LinearBaselineParams:
     mu: torch.Tensor  # Shape: (D,)
@@ -707,6 +774,109 @@ class SplineBaselineModule(BaselineIntensityModule):
         # event_types shape: (B, N)
         # Using gather to pick the d-th intensity
         # Not sure if clamp is necesarry, but they get masked out anyway later.
+        event_intensities = torch.gather(
+            all_intensities, dim=2, index=ts.event_types.unsqueeze(2).clamp(min=0)
+        ).squeeze(2)
+
+        event_intensities = event_intensities.masked_fill(~valid_events, 0.0)
+
+        return event_intensities
+
+
+# UnconstrainedSplineBaselineParams is an alias - same structure, different semantics
+UnconstrainedSplineBaselineParams = SplineBaselineParams
+
+
+class UnconstrainedSplineBaselineModule(BaselineIntensityModule):
+    """
+    Spline-based baseline module with unconstrained (real-valued) output.
+
+    For use with InhibitiveHawkesProcess where the positivity constraint
+    (e.g., softplus) is applied to the TOTAL intensity (baseline + kernel),
+    not to individual components.
+
+    This avoids the double-softplus problem where gradients are attenuated.
+    """
+
+    def __init__(
+        self,
+        D: int,
+        num_knots: int,
+        delta_t: torch.Tensor | float,
+        params: Optional[SplineBaselineParams] = None,
+        seed: Optional[int] = 42,
+    ):
+        super().__init__(D)
+
+        if params is None:
+            self.D = D
+            self.num_knots = num_knots
+
+            # Initialize heights to small values (will be combined with kernel then softplus'd)
+            # Values around 0-1 give reasonable outputs after softplus
+            initial_h = torch.rand(D, num_knots) * 0.5
+            self.h_knots = torch.nn.Parameter(initial_h)
+
+            if isinstance(delta_t, float) or delta_t.numel() == 1:
+                knot_locs = torch.arange(num_knots, dtype=torch.float32) * delta_t
+            else:
+                knot_locs = torch.cumsum(delta_t, dim=0)
+
+            self.register_buffer("knot_locs", knot_locs)
+
+            assert self.knot_locs.shape[0] == self.h_knots.shape[1]
+
+        else:
+            # Store directly without inverse_softplus
+            self.h_knots = torch.nn.Parameter(params.h_knots)
+            knot_locs = torch.cumsum(params.delta_ts, dim=0)
+            self.register_buffer("knot_locs", knot_locs)
+            self.D = params.h_knots.shape[0]
+            self.num_knots = params.h_knots.shape[1]
+
+        assert self.num_knots == self.h_knots.shape[1], "Number of knots mismatch"
+
+    def transform_params(self):
+        """Return unconstrained parameters."""
+        return (self.h_knots,)
+
+    def get_heights(self):
+        """Returns unconstrained knot heights: Shape (D, num_knots)"""
+        return self.transform_params()
+
+    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData):
+        """
+        Unconstrained spline intensity.
+        Returns: (batch_size, D)
+        """
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+
+        (h,) = self.get_heights()  # (D, K)
+        intensity = LinearSpline.interpolate(self.knot_locs, h, t)  # (B,D)
+        return intensity
+
+    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+        """
+        Cumulative of unconstrained spline baseline.
+        Note: Only used for diagnostics; actual NLL uses numerical integration.
+        """
+        if T.dim() == 0:
+            T = T.unsqueeze(0)
+
+        (h,) = self.get_heights()  # (D,K)
+        integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=T)  # (B, D)
+        return integral
+
+    def positive_likelihood_intensities(self, ts: BatchedMVEventData):
+        """Return unconstrained spline values at event times."""
+        valid_events = ts.event_types != -1  # (B, N)
+
+        flat_times = ts.time_points.flatten()  # (B*N)
+
+        all_intensities = self.intensity(flat_times, ts)  # (B*N, D)
+        all_intensities = all_intensities.view(ts.shape[0], ts.shape[1], self.D)  # (B, N, D)
+
         event_intensities = torch.gather(
             all_intensities, dim=2, index=ts.event_types.unsqueeze(2).clamp(min=0)
         ).squeeze(2)
@@ -1074,6 +1244,10 @@ class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
 
     Uses softplus to ensure non-negative total intensity: λ(t) = softplus(μ + kernel(t))
 
+    Both baseline μ and kernel α are unconstrained, and softplus is applied only
+    to the final combined intensity. This avoids gradient attenuation from
+    nested positivity constraints.
+
     The kernel alpha values are unconstrained, allowing:
     - Positive alpha: excitation (past events increase future intensity)
     - Negative alpha: inhibition (past events decrease future intensity)
@@ -1082,11 +1256,11 @@ class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
     def __init__(
         self,
         D,
-        baseline_params: Optional[ConstantBaselineParams],
-        kernel_params: Optional[UnconstrainedExpKernelParams],
+        baseline_params: Optional[UnconstrainedConstantBaselineParams] = None,
+        kernel_params: Optional[UnconstrainedExpKernelParams] = None,
         seed: Optional[int] = 42,
     ):
-        baseline = ConstantBaselineModule(D, baseline_params)
+        baseline = UnconstrainedConstantBaselineModule(D, baseline_params)
         kernel = UnconstrainedExpKernelModule(D, kernel_params, seed)
         super().__init__(F.softplus, baseline, kernel, D, seed)
 
@@ -1096,6 +1270,10 @@ class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
     Inhibitive Hawkes process with spline baseline and unconstrained exponential kernel.
 
     Uses softplus to ensure non-negative total intensity: λ(t) = softplus(spline(t) + kernel(t))
+
+    Both baseline spline heights and kernel α are unconstrained, and softplus is applied
+    only to the final combined intensity. This avoids gradient attenuation from
+    nested positivity constraints.
 
     The kernel alpha values are unconstrained, allowing:
     - Positive alpha: excitation (past events increase future intensity)
@@ -1107,7 +1285,7 @@ class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
         D: int,
         num_knots: int,
         delta_t: torch.Tensor | float,
-        baseline_params: Optional[SplineBaselineParams] = None,
+        baseline_params: Optional[UnconstrainedSplineBaselineParams] = None,
         kernel_params: Optional[UnconstrainedExpKernelParams] = None,
         seed: Optional[int] = 42,
     ):
@@ -1122,7 +1300,9 @@ class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
             kernel_params: Kernel parameters. If None, initialized randomly.
             seed: Random seed
         """
-        baseline = SplineBaselineModule(D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed)
+        baseline = UnconstrainedSplineBaselineModule(
+            D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed
+        )
         kernel = UnconstrainedExpKernelModule(D, kernel_params, seed)
         super().__init__(F.softplus, baseline, kernel, D, seed)
 
