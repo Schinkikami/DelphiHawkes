@@ -15,6 +15,7 @@ Key features:
 
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, List
+import warnings
 import torch
 import torch.nn as nn
 
@@ -315,11 +316,17 @@ class TemporalPointProcess(nn.Module, ABC):
         B = ts.time_points.shape[0]
         L = ts.time_points.shape[1]
         valid_events = ts.event_types != -1  # (B, L) Mask for valid events (not padding)
+        device = ts.time_points.device
+
+        if L == 0:
+            # No events in the sequence
+            return torch.zeros(B, device=device) if log else torch.ones(B, device=device)
 
         # Gather intensities at event times
         intensities = torch.stack([self.intensity(ts.time_points[:, l], ts=ts) for l in range(L)], dim=1)  # (B, L, D)
-        event_types = ts.event_types.unsqueeze(-1)  # (B, L, 1)
-        intensities = torch.gather(intensities, dim=2, index=event_types).squeeze(-1)  # (B, L)
+        # Clamp event_types to valid range for gather (replace -1 with 0, will be masked out later)
+        event_types_clamped = ts.event_types.clamp(min=0).unsqueeze(-1)  # (B, L, 1)
+        intensities = torch.gather(intensities, dim=2, index=event_types_clamped).squeeze(-1)  # (B, L)
 
         min_intensity = 1e-12
         if log:
@@ -654,3 +661,254 @@ class TemporalPointProcess(nn.Module, ABC):
             batched = BatchedMVEventData([ts.time_points], [ts.event_types])
 
         return ts, time_samples, dist_samples
+
+
+class NumericalTemporalPointProcess(TemporalPointProcess, ABC):
+    """
+    Abstract base class for temporal point processes that require numerical integration.
+
+    This is a thin wrapper around TemporalPointProcess that always uses numerical
+    integration for cumulative intensity by setting use_analytical_ci=False.
+
+    Useful for models where:
+    - Analytical cumulative intensity is intractable
+    - Intensity involves non-linear transformations (e.g., softplus)
+    - Testing/debugging numerical integration methods
+    """
+
+    def __init__(
+        self,
+        D: int,
+        seed: Optional[int] = 42,
+        ci_integration_method: str = "mc_trapezoidal",
+        ci_num_points: int = 10,
+    ):
+        """
+        Initialize a numerical temporal point process.
+
+        Args:
+            D: Number of event types (dimensions)
+            seed: Random seed for reproducibility
+            ci_integration_method: Method for numerical integration ("trapezoidal" or "mc_trapezoidal")
+                Default is "mc_trapezoidal" which uses Monte Carlo sampling with trapezoidal rule
+            ci_num_points: Number of points for numerical integration
+                Default is 10, which is relatively coarse but fast
+        """
+        super().__init__(
+            D=D,
+            seed=seed,
+            use_analytical_ci=False,  # Always use numerical integration
+            ci_integration_method=ci_integration_method,
+            ci_num_points=ci_num_points,
+        )
+
+    def likelihood(
+        self,
+        ts: BatchedMVEventData,
+        T: torch.Tensor,
+        log: bool = True,
+    ) -> torch.Tensor:
+        """
+        Compute the positive part of the likelihood: product of intensities at event times.
+
+        This corresponds to the "data fit" term in the likelihood, measuring how well
+        the model predicts the observed events.
+
+        Can be overwritten to provide a far more efficient implementation that only computes the likelihood of the "correct" classes at each time-point.
+
+        Args:
+            ts: Observed event sequences (batched, padded). Shape: (batch_size, seq_len)
+            T: End time of observation window. Shape: (batch_size,)
+            log: If True, return log-likelihood; otherwise return likelihood
+
+        Returns:
+            Likelihood for each batch. Shape: (batch_size,)
+
+        Mathematical definition:
+            L = (∏ᵢ λ(tᵢ, mᵢ)) × exp(-∑_d ∫₀ᵀ λ_d(t) dt)
+            log L = ∑ᵢ log λ(tᵢ, mᵢ) - ∑_d ∫₀ᵀ λ_d(t) dt
+        """
+        B = ts.time_points.shape[0]
+        L = ts.time_points.shape[1]
+        valid_events = ts.event_types != -1  # (B, L) Mask for valid events (not padding)
+        device = ts.time_points.device
+
+        # Convert T to double to match ts.time_points dtype
+        T = T.double()
+
+        # Validate T shape
+        if T.shape[0] != B:
+            raise ValueError(f"T must have shape ({B},) to match batch size, but got shape {T.shape}")
+
+        # Validate that T >= 0 for all sequences
+        if (T < 0).any():
+            raise ValueError(f"T must be non-negative for all sequences. Got min T = {T.min().item()}")
+
+        # Validate that T >= ts.max_time for all sequences (observation window must extend beyond last event)
+        # For empty sequences, ts.max_time is 0, so this is always satisfied if T >= 0
+        if (T < ts.max_time).any():
+            invalid_mask = T < ts.max_time
+            raise ValueError(
+                f"T must be >= last event time (ts.max_time) for all sequences. "
+                f"Found {invalid_mask.sum().item()} sequences where T < ts.max_time. "
+                f"Min difference: {(ts.max_time - T).max().item():.6f}"
+            )
+
+        # If T > ts.max_time provide a warning that sampling over ts.max_time is sparser then below it.
+        if (T > ts.max_time).any():
+            warnings.warn(
+                "Some T values are greater than the last event time in ts. "
+                "Numerical integration may be less accurate beyond the last event time."
+            )
+
+        # Handle empty sequences (L=0) early - only negative likelihood
+        if L == 0:
+            # No events, only negative likelihood contribution
+            return self.negative_likelihood(ts, T, log=log)
+
+        # Gather intensities at event times
+        intensities = torch.stack([self.intensity(ts.time_points[:, l], ts=ts) for l in range(L)], dim=1)  # (B, L, D)
+        # Clamp event_types to valid range for gather (replace -1 with 0, will be masked out later)
+        event_types_clamped = ts.event_types.clamp(min=0).unsqueeze(-1)  # (B, L, 1)
+        selected_intensities = torch.gather(intensities, dim=2, index=event_types_clamped).squeeze(-1)  # (B, L)
+
+        min_intensity = 1e-12
+        if log:
+            # Clamp intensities to avoid log(0) = -inf or log(negative) = nan
+            selected_intensities_clamped = torch.clamp(selected_intensities, min=min_intensity)
+            selected_log_intensities = torch.log(selected_intensities_clamped)
+            # Screen out invalid contributions. Set them to 0.0 so they dont contribute to the next sum.
+            selected_log_intensities[~valid_events] = 0.0
+            positive_likelihood = torch.sum(input=selected_log_intensities, dim=-1)  # Shape: (B,)
+        else:
+            # Have to set the invalid events to 1.0, so they dont contribute to the product.
+            # Also clamp to ensure non-negative intensities
+            selected_intensities_clamped = torch.clamp(selected_intensities, min=min_intensity)
+            selected_intensities_clamped[~valid_events] = 1.0
+            positive_likelihood = torch.prod(selected_intensities_clamped, dim=-1)  # Shape: (B,)
+
+        # Mask out event sequences with no elements. They only contribute negativly.
+        num_0 = valid_events.sum(dim=1) == 0
+        positive_likelihood[num_0] = torch.tensor(0.0) if log else torch.tensor(1.0)
+
+        # Compute negative likelihood using numerical integration
+
+        # Each batch needs ci_num_points total points. We already have valid_events.sum(dim=1) points.
+        # Use minimum valid events to ensure we have enough sampled points for all batches
+        min_valid_events = valid_events.sum(dim=1).min().item()
+        num_to_sample: int = max(2, self.ci_num_points - min_valid_events)
+
+        if self.ci_integration_method == "trapezoidal":
+            # Sample points uniformly in [0, max_time] for each batch
+            t_vals = torch.linspace(0, 1, num_to_sample, device=device)
+            t_vals = T.unsqueeze(1) * t_vals.unsqueeze(0)  # (B, num_to_sample)
+        else:  # self.ci_integration_method == "mc_trapezoidal"
+            # Sample points randomly in [0, max_time], always include 0 and max_time
+            uniform_samples = torch.rand((B, num_to_sample - 2), generator=self.generator, device=device)
+            uniform_samples = torch.cat(
+                [torch.zeros((B, 1), device=device), uniform_samples, torch.ones((B, 1), device=device)], dim=1
+            )  # (B, num_to_sample)
+            t_vals = T.unsqueeze(1) * uniform_samples  # (B, num_to_sample)
+
+        # Compute intensity value at sampled points
+        sample_intensities = torch.stack(
+            [self.intensity(t=t_vals[:, k], ts=ts) for k in range(num_to_sample)], dim=1
+        )  # Shape: (B, num_to_sample, D)
+
+        # Only include VALID event times and their intensities (exclude padding)
+        # Replace invalid times with -1 (will be filtered after sort)
+        valid_event_times = ts.time_points.clone()  # (B, L)
+        valid_event_times[~valid_events] = -1.0  # Mark invalid with -1
+
+        # Combine sampled and valid event times/intensities
+        time_points = torch.cat([t_vals, valid_event_times], dim=1)  # (B, num_to_sample + L)
+        combined_intensities = torch.cat([sample_intensities, intensities], dim=1)  # (B, num_to_sample + L, D)
+
+        # Sort by time
+        time_points, indices = torch.sort(time_points, dim=1)
+        indices_expanded = indices.unsqueeze(2).expand(-1, -1, self.D)
+        combined_intensities = torch.gather(combined_intensities, 1, indices_expanded)
+
+        # Create mask for valid points (time >= 0, i.e., not the -1 markers)
+        valid_points = time_points >= 0  # (B, num_to_sample + L)
+
+        # For trapezoidal integration, we need consecutive valid points
+        # A segment [i, i+1] is valid if both endpoints are valid
+        segment_valid = valid_points[:, :-1] & valid_points[:, 1:]  # (B, num_to_sample + L - 1)
+
+        # Compute segment-wise integrals using trapezoidal rule
+        dt = time_points[:, 1:] - time_points[:, :-1]  # (B, num_to_sample + L - 1)
+        avg_intensity = (
+            combined_intensities[:, 1:, :] + combined_intensities[:, :-1, :]
+        ) / 2  # (B, num_to_sample + L - 1, D)
+
+        # Segment areas: dt * avg_intensity, but only for valid segments
+        segment_areas = dt.unsqueeze(2) * avg_intensity  # (B, num_to_sample + L - 1, D)
+        segment_areas[~segment_valid.unsqueeze(2).expand_as(segment_areas)] = 0.0
+
+        # Sum all segment areas to get total integral
+        integrals = segment_areas.sum(dim=1)  # (B, D)
+
+        if log:
+            negative_likelihood = torch.sum(-integrals, dim=1)  # Shape: (B,)
+        else:
+            negative_likelihood = torch.prod(torch.exp(-integrals), dim=1)  # Shape: (B,)
+
+        if log:
+            return positive_likelihood + negative_likelihood
+        else:
+            return positive_likelihood * negative_likelihood
+
+
+class DebugNumericalPoisson(NumericalTemporalPointProcess):
+    """
+    A simple constant-rate Poisson process for debugging NumericalTemporalPointProcess.
+
+    This is a homogeneous Poisson process with constant intensity μ for each dimension.
+    The intensity does NOT depend on history, making it easy to verify correctness.
+
+    Analytical solutions (for comparison):
+        - Intensity: λ_d(t) = μ_d (constant)
+        - Cumulative intensity: Λ_d(T) = μ_d * T
+        - Likelihood: log L = sum_i log(μ_{m_i}) - sum_d μ_d * T
+    """
+
+    def __init__(
+        self,
+        D: int,
+        mu: Optional[torch.Tensor] = None,
+        seed: Optional[int] = 42,
+        ci_integration_method: str = "trapezoidal",
+        ci_num_points: int = 50,
+    ):
+        """
+        Args:
+            D: Number of event types
+            mu: Base intensity rates. Shape: (D,). If None, defaults to ones.
+            seed: Random seed
+            ci_integration_method: Integration method for numerical CI
+            ci_num_points: Number of integration points
+        """
+        super().__init__(
+            D=D,
+            seed=seed,
+            ci_integration_method=ci_integration_method,
+            ci_num_points=ci_num_points,
+        )
+
+        if mu is None:
+            mu = torch.ones(D, dtype=torch.float64)
+        self.register_buffer("mu", mu)
+
+    def transform_params(self) -> Tuple[torch.Tensor, ...]:
+        """Return the intensity rates."""
+        return (self.mu,)
+
+    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """Constant intensity μ for all times."""
+        B = t.shape[0]
+        return self.mu.unsqueeze(0).expand(B, -1)  # (B, D)
+
+    def analytical_cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """Analytical CI for verification: Λ_d(T) = μ_d * T"""
+        return self.mu.unsqueeze(0) * T.unsqueeze(1)  # (B, D)
