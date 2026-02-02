@@ -19,32 +19,55 @@ def inverse_softplus(x: Tensor):
 
 
 class LinearSpline(torch.nn.Module):
+    """
+    Linear spline utility for interpolation, integration, and inverse integration.
+
+    All methods support two input shapes for time points t:
+        - Shape (B,): Same time point for all D dimensions (broadcast)
+        - Shape (B, D): Different time point for each dimension
+
+    Output is always shape (B, D).
+    """
+
     @staticmethod
     def interpolate(x_knots: torch.Tensor, y_knots: torch.Tensor, t: torch.Tensor):
         """Interpolates the splines at the given positions.
 
         Args:
             x_knots (torch.Tensor): Position of the splines. Shared between all splines. Shape: (K,)
-            y_knots (torch.Tensor): Height of the splines for each knot in each spline. Shape: (D,K)
-            t (torch.Tensor): Time-points where to interpolate the splines. Shape: (B,)
+            y_knots (torch.Tensor): Height of the splines for each knot in each spline. Shape: (D, K)
+            t (torch.Tensor): Time-points where to interpolate the splines. Shape: (B,) or (B, D)
 
         Returns:
-            interpolation (torch.Tensor): Interpolated splines at t. Shape: (B,D)
+            interpolation (torch.Tensor): Interpolated splines at t. Shape: (B, D)
         """
-        k, delta = LinearSpline._get_knot_info(x_knots, t)  # k: (B,), delta: (B,)
+        D, K = y_knots.shape
+        t_is_1d = t.dim() == 1
+        B = t.shape[0]
 
-        h_k = y_knots[:, k]  # (D,B)
+        # Get knot info on original shape (cheaper searchsorted for 1D case)
+        k, delta = LinearSpline._get_knot_info(x_knots, t)  # (B,) or (B, D)
 
         delta_times = x_knots[1:] - x_knots[:-1]  # (K-1)
-        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (K-1)
+        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (D, K-1)
         slopes = delta_heights / delta_times  # (D, K-1)
         segment_slopes = F.pad(slopes, (0, 1), value=0.0)  # (D, K)
 
-        slope_k = segment_slopes[:, k]  # (D,B)
+        if t_is_1d:
+            # k has shape (B,), can use simple indexing (broadcasts across D)
+            h_k = y_knots[:, k]  # (D, B)
+            slope_k = segment_slopes[:, k]  # (D, B)
+            delta_2d = delta.unsqueeze(0)  # (1, B) -> broadcasts to (D, B)
+        else:
+            # k has shape (B, D), need to use gather
+            k_2d = k.T  # (D, B)
+            h_k = torch.gather(y_knots, 1, k_2d)  # (D, B)
+            slope_k = torch.gather(segment_slopes, 1, k_2d)  # (D, B)
+            delta_2d = delta.T  # (D, B)
 
-        interpolation = h_k + slope_k * delta.unsqueeze(0)  # (D,B)
+        interpolation = h_k + slope_k * delta_2d  # (D, B)
 
-        return interpolation.T  # (B,D)
+        return interpolation.T  # (B, D)
 
     @staticmethod
     def integrate(x_knots: torch.Tensor, y_knots: torch.Tensor, t: torch.Tensor):
@@ -52,42 +75,54 @@ class LinearSpline(torch.nn.Module):
 
         Args:
             x_knots (torch.Tensor): Position of the splines. Shared between all splines. Shape: (K,)
-            y_knots (torch.Tensor): Height of the splines for each spline and each knot. Shape: (D,K)
-            t (torch.Tensor): Time-points where up to where to integrate the splines (starting from 0). Shape: (B,)
+            y_knots (torch.Tensor): Height of the splines for each spline and each knot. Shape: (D, K)
+            t (torch.Tensor): Time-points where up to where to integrate the splines (starting from 0).
+                              Shape: (B,) or (B, D)
 
         Returns:
-            integral: (torch.Tensor): Integrated splines up to t. Shape: (B,D)
+            integral: (torch.Tensor): Integrated splines up to t. Shape: (B, D)
         """
-        k, delta = LinearSpline._get_knot_info(x_knots=x_knots, t=t)  # (B,), (B,)
+        D, K = y_knots.shape
+        t_is_1d = t.dim() == 1
+        B = t.shape[0]
+
+        # Get knot info on original shape (cheaper searchsorted for 1D case)
+        k, delta = LinearSpline._get_knot_info(x_knots=x_knots, t=t)  # (B,) or (B, D)
 
         delta_times = x_knots[1:] - x_knots[:-1]  # (K-1)
-        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (K-1)
+        delta_heights = y_knots[:, 1:] - y_knots[:, :-1]  # (D, K-1)
         slopes = delta_heights / delta_times  # (D, K-1)
 
         segment_areas = (
             y_knots[:, :-1] * delta_times + slopes / 2.0 * delta_times.unsqueeze(0) ** 2
-        )  # integral_0^t ( h + slope * s)  ds, Shape: (D,K-1)
+        )  # integral_0^t ( h + slope * s)  ds, Shape: (D, K-1)
 
-        prefix_sums = torch.cumsum(segment_areas, dim=1)  # Shape: (D,K-1)
+        prefix_sums = torch.cumsum(segment_areas, dim=1)  # Shape: (D, K-1)
         prefix_sums = F.pad(prefix_sums, (1, 0), value=0.0)  # (D, K)
         segment_slopes = F.pad(slopes, (0, 1), value=0.0)  # (D, K)
 
-        # Extract info for current interval
-        C_k = prefix_sums[:, k]  # (D,B)
-        s_k = segment_slopes[:, k]  # (D,B)
-        h_k = y_knots[:, k]  # (D,B)
-        last_knot_loc = x_knots[k]  # (B,)
-        d_t = t - last_knot_loc  # (B,)
+        if t_is_1d:
+            # k has shape (B,), can use simple indexing (broadcasts across D)
+            C_k = prefix_sums[:, k]  # (D, B)
+            s_k = segment_slopes[:, k]  # (D, B)
+            h_k = y_knots[:, k]  # (D, B)
+            delta_2d = delta.unsqueeze(0)  # (1, B) -> broadcasts to (D, B)
+        else:
+            # k has shape (B, D), need to use gather
+            k_2d = k.T  # (D, B)
+            C_k = torch.gather(prefix_sums, 1, k_2d)  # (D, B)
+            s_k = torch.gather(segment_slopes, 1, k_2d)  # (D, B)
+            h_k = torch.gather(y_knots, 1, k_2d)  # (D, B)
+            delta_2d = delta.T  # (D, B)
 
         # Integral of previous segments + square_area + triangular area
-        # Done like this to avoid zero multiplications which can lead to NaNs if d_t is Infinite
+        # Done like this to avoid zero multiplications which can lead to NaNs if delta_2d is Infinite
         integral = C_k
-        integral += torch.where(h_k != 0.0, h_k * d_t.unsqueeze(0), torch.zeros_like(h_k))
-        integral += torch.where(s_k != 0.0, s_k / 2 * delta.unsqueeze(0) ** 2, torch.zeros_like(s_k))
-        # (D,B)
-        # integral = C_k + h_k * d_t.unsqueeze(0) + s_k / 2 * delta.unsqueeze(0) ** 2  # (D,B)
+        integral = integral + torch.where(h_k != 0.0, h_k * delta_2d, torch.zeros_like(h_k))
+        integral = integral + torch.where(s_k != 0.0, s_k / 2 * delta_2d**2, torch.zeros_like(s_k))
+        # (D, B)
 
-        return integral.T  # (B,D)
+        return integral.T  # (B, D)
 
     @staticmethod
     def inverse_integral(x_knots: torch.Tensor, y_knots: torch.Tensor, u: torch.Tensor):
@@ -97,7 +132,7 @@ class LinearSpline(torch.nn.Module):
 
         Args:
             x_knots (torch.Tensor): Position of the splines. Shared between all splines. Shape: (K,)
-            y_knots (torch.Tensor): Height of the splines for each spline and each knot. Shape: (D,K)
+            y_knots (torch.Tensor): Height of the splines for each spline and each knot. Shape: (D, K)
             u (torch.Tensor): Target integral values. Shape: (B, D)
 
         Returns:
@@ -126,7 +161,7 @@ class LinearSpline(torch.nn.Module):
         # u has shape (B, D), prefix_sums has shape (D, K)
         # Find k such that prefix_sums[d, k] <= u[b, d] < prefix_sums[d, k+1]
         k = torch.searchsorted(prefix_sums.unsqueeze(0).expand((B, D, K)), u.unsqueeze(2), right=True) - 1
-        k = k.squeeze(2).T  # (B,D)
+        k = k.squeeze(2).T  # (D, B)
 
         # Extract segment info for each (d, b) pair
         # k has shape (D, B)
@@ -170,14 +205,18 @@ class LinearSpline(torch.nn.Module):
         return t.T  # (B, D)
 
     @staticmethod
-    def _get_knot_info(x_knots, t: torch.Tensor):
+    def _get_knot_info(x_knots: torch.Tensor, t: torch.Tensor):
         """
         Calculates indices and relative offsets for time points.
-        x_knots: Location of the knots (K,)
-        t: (batch_size,)
-        returns: k (indices, Shape:(B,)), delta (t - t_k, Shape:(B,))
-        """
 
+        Args:
+            x_knots: Location of the knots. Shape: (K,)
+            t: Time points. Shape: (B,) or (B, D) - any shape is supported
+
+        Returns:
+            k: Knot indices. Shape: same as t
+            delta: Offset from knot (t - x_knots[k]). Shape: same as t
+        """
         k = torch.searchsorted(x_knots, t, right=True) - 1
         delta = t - x_knots[k]
         return k, delta

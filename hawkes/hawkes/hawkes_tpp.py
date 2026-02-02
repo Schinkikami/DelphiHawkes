@@ -24,6 +24,16 @@ class BaselineIntensityModule(nn.Module, ABC):
 
     A baseline module represents the exogenous intensity (spontaneous event rate)
     in the Hawkes process. It is independent of historical events.
+
+    Termination Handling:
+        Baseline modules do NOT know about termination directly. The parent
+        HawkesProcess computes termination_times and passes them to cumulative_intensity().
+        The module should compute the integral up to min(T, termination_times) for each
+        dimension when termination_times is provided.
+
+        For intensity(), termination masking is handled at the HawkesProcess level
+        (via TemporalPointProcess._get_termination_mask), so modules just return
+        raw intensity values.
     """
 
     def __init__(self, D: int):
@@ -59,13 +69,21 @@ class BaselineIntensityModule(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the integral of baseline intensity from 0 to T.
+
+        For terminating processes, computes the integral up to min(T, termination_times)
+        for each dimension.
 
         Args:
             T: End times. Shape: (B,)
             ts: Historical events (for context, may not be used by all baselines). Shape: (B,N)
+            termination_times: Optional termination time for each type. Shape: (B, D)
+                If provided, CI is computed up to min(T, termination_times) for each dimension.
+                For non-terminating processes, this will be None.
 
         Returns:
             Cumulative baseline intensity for each event type. Shape: (B,D)
@@ -103,7 +121,9 @@ class BaselineIntensityModule(nn.Module, ABC):
 
         return intensities  # (B, L)
 
-    def negative_likelihood_intensities(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def negative_likelihood_intensities(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the negative part of the likelihood for the baseline intensities: the cumulative baseline intensities up to time T.
 
@@ -112,11 +132,13 @@ class BaselineIntensityModule(nn.Module, ABC):
         Args:
             T: End times for each sequence in batch. Shape: (batch_size,)
             ts: Observed event sequences (batched, padded). Shape: (batch_size, seq_len)
+            termination_times: Optional termination time for each type. Shape: (B, D)
+                If provided, CI is computed up to min(T, termination_times) for each dimension.
 
         Returns:
             Cumulative baseline intensities for each sequence in batch. Shape: (batch_size, D)
         """
-        return self.cumulative_intensity(T, ts)  # (B, D)
+        return self.cumulative_intensity(T, ts, termination_times=termination_times)  # (B, D)
 
 
 class KernelIntensityModule(nn.Module, ABC):
@@ -125,6 +147,16 @@ class KernelIntensityModule(nn.Module, ABC):
 
     A kernel module represents the endogenous component (self-exciting/self-inhibiting),
     capturing how past events influence future event intensity.
+
+    Termination Handling:
+        Kernel modules do NOT know about termination directly. The parent
+        HawkesProcess computes termination_times and passes them to cumulative_intensity().
+        The module should compute the integral up to min(T, termination_times) for each
+        dimension when termination_times is provided.
+
+        For intensity(), termination masking is handled at the HawkesProcess level
+        (via TemporalPointProcess._get_termination_mask), so modules just return
+        raw intensity values.
     """
 
     def __init__(self, D: int):
@@ -160,13 +192,20 @@ class KernelIntensityModule(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the integral of kernel intensity from 0 to T.
+
+        For terminating processes, subclasses should handle the termination_times parameter
+        to compute the integral up to min(T, termination_times) for each dimension.
 
         Args:
             T: End times. Shape: (B,)
             ts: Historical events. Shape: (B,N)
+            termination_times: Optional termination time for each type. Shape: (B, D)
+                If provided, CI should be computed up to min(T, termination_times) for each dimension.
 
         Returns:
             Cumulative kernel intensity for each event type. Shape: (B,D)
@@ -204,7 +243,9 @@ class KernelIntensityModule(nn.Module, ABC):
 
         return intensities  # (B, L)
 
-    def negative_likelihood_intensities(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def negative_likelihood_intensities(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the negative part of the likelihood for the kernel intensities: the cumulative kernel intensities up to time T.
 
@@ -213,11 +254,13 @@ class KernelIntensityModule(nn.Module, ABC):
         Args:
             T: End times for each sequence in batch. Shape: (batch_size,)
             ts: Observed event sequences (batched, padded). Shape: (batch_size, seq_len)
+            termination_times: Optional termination time for each type. Shape: (B, D)
+                If provided, CI is computed up to min(T, termination_times) for each dimension.
 
         Returns:
             Cumulative kernel intensities for each sequence in batch. Shape: (batch_size, D)
         """
-        return self.cumulative_intensity(T, ts)  # (B, D)
+        return self.cumulative_intensity(T, ts, termination_times=termination_times)  # (B, D)
 
 
 class HawkesProcess(TemporalPointProcess, ABC):
@@ -237,6 +280,7 @@ class HawkesProcess(TemporalPointProcess, ABC):
         kernel: KernelIntensityModule,
         D: int,
         seed: Optional[int] = 42,
+        terminating: bool = False,
     ):
         """
         Args:
@@ -244,8 +288,9 @@ class HawkesProcess(TemporalPointProcess, ABC):
             kernel: KernelIntensityModule instance
             D: Number of event types
             seed: Random seed
+            terminating: If True, each event type can only occur once
         """
-        super().__init__(D, seed, use_analytical_ci=True)
+        super().__init__(D, seed, use_analytical_ci=True, terminating=terminating)
         self.baseline = baseline
         self.kernel = kernel
 
@@ -263,34 +308,45 @@ class HawkesProcess(TemporalPointProcess, ABC):
         kernel_params = self.kernel.transform_params()
         return (*baseline_params, *kernel_params)
 
-    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def _raw_intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
         """
-        Compute total intensity = baseline + kernel.
+        Compute total raw intensity = baseline + kernel (before termination masking).
 
         Args:
             t: Time points. Shape: (B,)
             ts: Historical events. Shape: (B,N)
 
         Returns:
-            Total intensity. Shape: (B,D)
+            Total raw intensity. Shape: (B,D)
         """
         baseline_intensity = self.baseline.intensity(t, ts)  # (B,D)
         kernel_intensity = self.kernel.intensity(t, ts)  # (B,D)
         return baseline_intensity + kernel_intensity
 
-    def analytical_cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def _raw_analytical_cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute total cumulative intensity = baseline CI + kernel CI.
+
+        For terminating processes, computes up to min(T, termination_times) for each dimension.
+        The termination_times are computed by the parent TPP class in analytical_cumulative_intensity()
+        and passed down here. Baseline and kernel modules handle termination internally.
 
         Args:
             T: End times. Shape: (B,)
             ts: Historical events. Shape: (B,N)
+            termination_times: Optional termination times per dimension. Shape: (B, D)
+                If provided, CI is computed up to min(T, termination_times) for each dimension.
+                For non-terminating processes, this will be None.
 
         Returns:
             Total cumulative intensity. Shape: (B,D)
         """
-        baseline_ci = self.baseline.cumulative_intensity(T, ts)  # (B,D)
-        kernel_ci = self.kernel.cumulative_intensity(T, ts)  # (B,D)
+        # Both baseline and kernel modules now accept termination_times
+        baseline_ci = self.baseline.cumulative_intensity(T, ts, termination_times=termination_times)  # (B,D)
+        kernel_ci = self.kernel.cumulative_intensity(T, ts, termination_times=termination_times)  # (B,D)
+
         return baseline_ci + kernel_ci
 
     def positive_likelihood(self, ts: BatchedMVEventData, log: bool = True) -> torch.Tensor:
@@ -343,6 +399,7 @@ class InhibitiveHawkesProcess(TemporalPointProcess, ABC):
         kernel: KernelIntensityModule,
         D: int,
         seed: Optional[int] = 42,
+        terminating: bool = False,
     ):
         """
         Args:
@@ -350,8 +407,9 @@ class InhibitiveHawkesProcess(TemporalPointProcess, ABC):
             kernel: KernelIntensityModule instance
             D: Number of event types
             seed: Random seed
+            terminating: If True, each event type can only occur once
         """
-        super().__init__(D, seed, use_analytical_ci=False)
+        super().__init__(D, seed, use_analytical_ci=False, terminating=terminating)
         self.baseline = baseline
         self.kernel = kernel
         self.positivity_constraint = positive_constraint
@@ -370,16 +428,16 @@ class InhibitiveHawkesProcess(TemporalPointProcess, ABC):
         kernel_params = self.kernel.transform_params()
         return (*baseline_params, *kernel_params)
 
-    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def _raw_intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
         """
-        Compute total intensity = baseline + kernel.
+        Compute total raw intensity = positivity_constraint(baseline + kernel) (before termination masking).
 
         Args:
             t: Time points. Shape: (B,)
             ts: Historical events. Shape: (B,N)
 
         Returns:
-            Total intensity. Shape: (B,D)
+            Total raw intensity. Shape: (B,D)
         """
         baseline_intensity = self.baseline.intensity(t, ts)  # (B,D)
         kernel_intensity = self.kernel.intensity(t, ts)  # (B,D)
@@ -456,10 +514,25 @@ class ConstantBaselineModule(BaselineIntensityModule):
         batch_size = t.shape[0]
         return mu.unsqueeze(0).expand(batch_size, self.D)  # Shape: (B,D)
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
-        """Cumulative intensity: mu * T."""
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Cumulative intensity: mu * T.
+
+        For terminating processes, computes mu * min(T, termination_times) for each dimension.
+        """
         (mu,) = self.transform_params()  # Shape: (D,)
-        return mu.unsqueeze(0) * T.unsqueeze(1)  # Shape: (B,D)
+        B = T.shape[0]
+
+        # Compute effective end time for each dimension
+        if termination_times is not None:
+            T_expanded = T.unsqueeze(1).expand(B, self.D)  # (B, D)
+            effective_T = torch.minimum(T_expanded, termination_times)  # (B, D)
+        else:
+            effective_T = T.unsqueeze(1)  # (B, 1) broadcasts to (B, D)
+
+        return mu.unsqueeze(0) * effective_T  # Shape: (B,D)
 
 
 # UnconstrainedConstantBaselineParams is an alias - same structure, different semantics
@@ -506,7 +579,9 @@ class UnconstrainedConstantBaselineModule(BaselineIntensityModule):
         batch_size = t.shape[0]
         return mu.unsqueeze(0).expand(batch_size, self.D)  # Shape: (B,D)
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Cumulative of unconstrained baseline: mu * T.
 
@@ -514,7 +589,16 @@ class UnconstrainedConstantBaselineModule(BaselineIntensityModule):
         uses numerical integration of the constrained total intensity.
         """
         (mu,) = self.transform_params()  # Shape: (D,)
-        return mu.unsqueeze(0) * T.unsqueeze(1)  # Shape: (B,D)
+        B = T.shape[0]
+
+        # Compute effective end time for each dimension
+        if termination_times is not None:
+            T_expanded = T.unsqueeze(1).expand(B, self.D)  # (B, D)
+            effective_T = torch.minimum(T_expanded, termination_times)  # (B, D)
+        else:
+            effective_T = T.unsqueeze(1)  # (B, 1) broadcasts to (B, D)
+
+        return mu.unsqueeze(0) * effective_T  # Shape: (B,D)
 
     def positive_likelihood_intensities(self, ts: BatchedMVEventData) -> torch.Tensor:
         """Return unconstrained mu at all event times."""
@@ -599,21 +683,31 @@ class LinearBaselineModule(BaselineIntensityModule):
         intensity = torch.exp(mu.unsqueeze(0) + slope.unsqueeze(0) * t.unsqueeze(1))  # Shape: (B,D)
         return intensity
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ):
         """
-        Computes the cumulative intensity function from t=0 up to T, not from the last event time, as we need the full integral for the likelihood.
-        To obtain the cumulative intensity from t_n up to T, consider subtracting the CIs.--> cumulative_intensity(T) - cumulative_intensity(t_n)
+        Computes the cumulative intensity function from t=0 up to effective_T.
 
-        :param self: Description
-        :param T: Description
-        :type T: torch.Tensor
-        :param ts: Description
-        :type ts: BatchedMVEventData
+        For terminating processes, computes the integral up to min(T, termination_times)
+        for each dimension.
+
+        Args:
+            T: End times. Shape: (B,)
+            ts: Historical events. Shape: (B, N)
+            termination_times: Optional termination times per dimension. Shape: (B, D)
         """
+        B = T.shape[0]
+        mu, slope = self.transform_params()  # (D,) (D,)
 
-        mu, slope = self.transform_params()
+        # Compute effective end time for each dimension
+        if termination_times is not None:
+            T_expanded = T.unsqueeze(1).expand(B, self.D)  # (B, D)
+            effective_T = torch.minimum(T_expanded, termination_times)  # (B, D)
+        else:
+            effective_T = T.unsqueeze(1).expand(B, self.D)  # (B, D)
 
-        slope_0 = torch.abs(slope) < 1e-8
+        slope_0 = torch.abs(slope) < 1e-8  # (D,)
 
         # At slope == 0 (or very close) we use the Taylor expansion to avoid division by zero.
         # This is better than adding a deadzone to the gradient: lim b-> 0 int_0^T exp(a+bt) dt = int_0^T exp(a) dt = exp(a) *T. However this forumulation does not have gradient for b.
@@ -621,30 +715,27 @@ class LinearBaselineModule(BaselineIntensityModule):
         # Therefore exp(bT) = 1 + bT + b^2T^2/2 + ... at these very small b.
         # --> (exp(bT) -1)/b = T + bT^2/2 + b^2T^3/6 + ...
         # --> e^mu * (exp(bT) -1)/b = e^mu * (T + bT^2/2 + b^2T^3/6 + ...)
-        taylor_expansion_at_b = torch.exp(mu.unsqueeze(1)) * (
-            T.unsqueeze(0)
-            + slope.unsqueeze(1) * T.unsqueeze(0) ** 2 / 2
-            + slope.unsqueeze(1) ** 2 * T.unsqueeze(0) ** 3 / 6
-        )
+        taylor_expansion_at_b = torch.exp(mu.unsqueeze(0)) * (
+            effective_T + slope.unsqueeze(0) * effective_T**2 / 2 + slope.unsqueeze(0) ** 2 * effective_T**3 / 6
+        )  # (B,D)
 
         fixed_slope = slope.clone()
         fixed_slope[slope_0] = 1.0  # avoid division by zero
 
-        closed_form_integral = torch.zeros_like(taylor_expansion_at_b)
         closed_form_integral = (
-            torch.exp(mu.unsqueeze(1))
-            / fixed_slope.unsqueeze(1)
-            * (torch.exp(fixed_slope.unsqueeze(1) * T.unsqueeze(0)) - 1)
-        )
+            torch.exp(mu.unsqueeze(0))
+            / fixed_slope.unsqueeze(0)
+            * (torch.exp(fixed_slope.unsqueeze(0) * effective_T) - 1)
+        )  # (B,D)
 
         # Here we replace the normal integral form of int_0^T exp(mu +slope t) dt = 1/b exp(mu + slope T) - 1/b exp(mu) = 1/b * exp(mu) * (exp(slope T) - 1) = 1/b *exp(mu) * expm1(slop T).
         integral = torch.where(
-            slope_0.unsqueeze(1),
+            slope_0.unsqueeze(0),
             taylor_expansion_at_b,  # torch.exp(mu.unsqueeze(1)) * T.unsqueeze(0),
             closed_form_integral,  # torch.exp(mu.unsqueeze(1) + slope.unsqueeze(1) * T.unsqueeze(0)) / slope.unsqueeze(1)
-        )  # Shape: (D,B)
+        )  # Shape: (B,D)
 
-        return integral.T  # Shape: (B,D)
+        return integral  # (B, D)
 
     def positive_likelihood_intensities(
         self,
@@ -740,21 +831,38 @@ class SplineBaselineModule(BaselineIntensityModule):
 
         return intensity
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ):
         """
         Calculates the integral from 0 to T for each dimension.
+
+        For terminating processes, computes the integral up to min(T, termination_times)
+        for each dimension.
+
+        Args:
+            T: End times. Shape: (B,)
+            ts: Historical events. Shape: (B, N)
+            termination_times: Optional termination times per dimension. Shape: (B, D)
+
         Returns: (batch_size, D)
         """
-
-        # Expand T into 1-dimensional tensor if needed
         if T.dim() == 0:
             T = T.unsqueeze(0)
 
-        (h,) = self.get_heights()  # (D,K)
+        B = T.shape[0]
+        (h,) = self.get_heights()  # (D, K)
 
-        integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=T)  # (B, D)
+        # Compute effective end time for each dimension
+        if termination_times is not None:
+            T_expanded = T.unsqueeze(1).expand(B, self.D)  # (B, D)
+            effective_T = torch.minimum(T_expanded, termination_times)  # (B, D)
+            # LinearSpline.integrate now accepts t of shape (B, D)
+            integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=effective_T)  # (B, D)
+        else:
+            integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=T)  # (B, D)
 
-        return integral  # (B,D)
+        return integral  # (B, D)
 
     def positive_likelihood_intensities(self, ts: BatchedMVEventData):
         # Identify valid events
@@ -856,16 +964,32 @@ class UnconstrainedSplineBaselineModule(BaselineIntensityModule):
         intensity = LinearSpline.interpolate(self.knot_locs, h, t)  # (B,D)
         return intensity
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ):
         """
         Cumulative of unconstrained spline baseline.
+
+        For terminating processes, computes the integral up to min(T, termination_times)
+        for each dimension.
+
         Note: Only used for diagnostics; actual NLL uses numerical integration.
         """
         if T.dim() == 0:
             T = T.unsqueeze(0)
 
-        (h,) = self.get_heights()  # (D,K)
-        integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=T)  # (B, D)
+        B = T.shape[0]
+        (h,) = self.get_heights()  # (D, K)
+
+        # Compute effective end time for each dimension
+        if termination_times is not None:
+            T_expanded = T.unsqueeze(1).expand(B, self.D)  # (B, D)
+            effective_T = torch.minimum(T_expanded, termination_times)  # (B, D)
+            # LinearSpline.integrate now accepts t of shape (B, D)
+            integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=effective_T)  # (B, D)
+        else:
+            integral = LinearSpline.integrate(x_knots=self.knot_locs, y_knots=h, t=T)  # (B, D)
+
         return integral
 
     def positive_likelihood_intensities(self, ts: BatchedMVEventData):
@@ -982,35 +1106,80 @@ class ExpKernelModule(KernelIntensityModule):
 
         return contributions.T  # Shape: (B,D)
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+    def cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute cumulative kernel intensity from 0 to T.
 
-        Λ_kernel_d(T) = Σ_{t_i < T} Σ_j α_{d,j} (1 - exp(-β_{d,j} (T - t_i)))
-        """
+        For terminating processes, computes the integral up to min(T, termination_times) for each dimension d:
+            Λ_kernel_d(effective_T_d) = Σ_{t_i < effective_T_d} Σ_j α_{d,j} (1 - exp(-β_{d,j} (effective_T_d - t_i)))
 
-        valid_mask = ts.event_types != -1  # Shape: (B,N)
-        past_event_mask = ts.time_points < T.unsqueeze(1)  # Shape: (B,N)
-        valid_mask = valid_mask & past_event_mask
+        Args:
+            T: End times. Shape: (B,)
+            ts: Historical events. Shape: (B,N)
+            termination_times: Optional termination time for each type. Shape: (B, D)
+                If provided, CI is computed up to min(T, termination_times) for each dimension.
+
+        Returns:
+            Cumulative kernel intensity for each event type. Shape: (B,D)
+        """
+        B = T.shape[0]
+        N = ts.time_points.shape[1] if len(ts) > 0 else 0
+
+        # Compute effective end time for each dimension
+        if termination_times is not None:
+            # T: (B,), termination_times: (B, D)
+            T_expanded = T.unsqueeze(1).expand_as(termination_times)  # (B, D)
+            effective_T = torch.minimum(T_expanded, termination_times)  # (B, D)
+        else:
+            # Non-terminating: use T for all dimensions
+            effective_T = T.unsqueeze(1).expand(B, self.D)  # (B, D)
 
         alpha, beta = self.transform_params()
 
-        integral = torch.zeros(self.D, T.shape[0], device=T.device, dtype=T.dtype)
+        integral = torch.zeros(self.D, B, device=T.device, dtype=T.dtype)
 
-        if len(ts) > 0:
-            # Vectorized multivariate implementation
-            delta_t = (T.unsqueeze(1) - ts.time_points).unsqueeze(0)  # Shape: (1,B,N)
-            delta_t = torch.where(valid_mask.unsqueeze(0), delta_t, torch.zeros_like(delta_t))
+        if N > 0:
+            # For terminating processes, we need per-dimension effective end times
+            # effective_T: (B, D), ts.time_points: (B, N)
+
+            # Valid events (not padding)
+            valid_events = ts.event_types != -1  # Shape: (B, N)
 
             # Clamp event_types to avoid negative indexing for padded entries (-1)
-            clamped_types = ts.event_types.clamp(min=0)
-            relevant_alpha = alpha[:, clamped_types]  # Shape: (D,B,N)
-            relevant_beta = beta[:, clamped_types]  # Shape: (D,B,N)
-            contributions = relevant_alpha * (1 - torch.exp(-relevant_beta * delta_t))  # Shape: (D,B,N)
-            contributions = contributions.masked_fill(~valid_mask.unsqueeze(0), 0)
-            integral = integral + torch.sum(contributions, dim=2)  # Shape: (D,B)
+            clamped_types = ts.event_types.clamp(min=0)  # (B, N)
 
-        integral = integral.T
+            # For each dimension d, we need to:
+            # 1. Only include events that occurred before effective_T[d]
+            # 2. Compute delta_t = effective_T[d] - t_i for those events
+
+            # Expand effective_T to (D, B, N) for broadcasting
+            effective_T_expanded = effective_T.T.unsqueeze(2)  # (D, B, 1) -> will broadcast to (D, B, N)
+
+            # Time points expanded: (B, N) -> (1, B, N)
+            time_points_expanded = ts.time_points.unsqueeze(0)  # (1, B, N)
+
+            # For each dimension, check which events are before effective_T for that dimension
+            past_event_mask = time_points_expanded < effective_T_expanded  # (D, B, N)
+
+            # Combine with valid_events mask: (B, N) -> (1, B, N) -> broadcast to (D, B, N)
+            valid_mask = valid_events.unsqueeze(0) & past_event_mask  # (D, B, N)
+
+            # Compute delta_t for each dimension
+            delta_t = effective_T_expanded - time_points_expanded  # (D, B, N)
+            delta_t = torch.where(valid_mask, delta_t, torch.zeros_like(delta_t))
+
+            # Get relevant alpha and beta for each event's trigger type
+            relevant_alpha = alpha[:, clamped_types]  # Shape: (D, B, N)
+            relevant_beta = beta[:, clamped_types]  # Shape: (D, B, N)
+
+            # Compute contributions
+            contributions = relevant_alpha * (1 - torch.exp(-relevant_beta * delta_t))  # Shape: (D, B, N)
+            contributions = contributions.masked_fill(~valid_mask, 0)
+            integral = integral + torch.sum(contributions, dim=2)  # Shape: (D, B)
+
+        integral = integral.T  # (B, D)
         return integral
 
     def positive_likelihood_intensities(self, ts: BatchedMVEventData) -> torch.Tensor:
@@ -1122,6 +1291,7 @@ class ExpKernelHawkesProcess(HawkesProcess):
         baseline_params: Optional[ConstantBaselineParams] = None,
         kernel_params: Optional[ExpKernelParams] = None,
         seed: Optional[int] = 42,
+        terminating: bool = False,
     ):
         """
         Initialize exponential kernel Hawkes process.
@@ -1132,11 +1302,12 @@ class ExpKernelHawkesProcess(HawkesProcess):
             alpha: Branching ratio matrix (D,D). If None, initialized randomly.
             beta: Decay rate matrix (D,D). If None, initialized randomly.
             seed: Random seed
+            terminating: If True, each event type can only occur once
         """
         baseline = ConstantBaselineModule(D, baseline_params)
         kernel = ExpKernelModule(D, kernel_params, seed)
 
-        super().__init__(baseline, kernel, D, seed)
+        super().__init__(baseline, kernel, D, seed, terminating=terminating)
 
 
 class LinearBaselineExpKernelHawkesProcess(HawkesProcess):
@@ -1152,6 +1323,7 @@ class LinearBaselineExpKernelHawkesProcess(HawkesProcess):
         baseline_params: Optional[LinearBaselineParams] = None,
         kernel_params: Optional[ExpKernelParams] = None,
         seed: Optional[int] = 42,
+        terminating: bool = False,
     ):
         """
         Initialize exponential kernel Hawkes process with a linear function baseline intensity
@@ -1161,11 +1333,12 @@ class LinearBaselineExpKernelHawkesProcess(HawkesProcess):
             baseline_params: If None, initialized randomly.
             kernel_params: If None, initialized randomly.
             seed: Random seed
+            terminating: If True, each event type can only occur once
         """
         baseline = LinearBaselineModule(baseline_params, D, seed)
         kernel = ExpKernelModule(D, kernel_params, seed)
 
-        super().__init__(baseline, kernel, D, seed)
+        super().__init__(baseline, kernel, D, seed, terminating=terminating)
 
 
 class SplineBaselineExpKernelHawkesProcess(HawkesProcess):
@@ -1183,6 +1356,7 @@ class SplineBaselineExpKernelHawkesProcess(HawkesProcess):
         baseline_params: Optional[SplineBaselineParams] = None,
         kernel_params: Optional[ExpKernelParams] = None,
         seed: Optional[int] = 42,
+        terminating: bool = False,
     ):
         """
         Initialize spline-based baseline exponential kernel Hawkes process.
@@ -1194,18 +1368,20 @@ class SplineBaselineExpKernelHawkesProcess(HawkesProcess):
             alpha: Branching ratio matrix (D,D). If None, initialized randomly.
             beta: Decay rate matrix (D,D). If None, initialized randomly.
             seed: Random seed
+            terminating: If True, each event type can only occur once
         """
         baseline = SplineBaselineModule(D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed)
         kernel = ExpKernelModule(D, kernel_params, seed)
 
-        super().__init__(baseline, kernel, D, seed)
+        super().__init__(baseline, kernel, D, seed, terminating=terminating)
 
 
 class NumericalSplineBaselineExpKernelHawkesProcess(HawkesProcess):
     """
     Hawkes process with spline-based baseline intensity and exponential kernel.
 
-    This version uses the HawkesProcess base class with SplineBaselineModule and ExpKernelModule.
+    This version uses numerical integration for cumulative intensity computation,
+    which is necessary when analytical solutions are intractable or for testing purposes.
     """
 
     def __init__(
@@ -1216,26 +1392,33 @@ class NumericalSplineBaselineExpKernelHawkesProcess(HawkesProcess):
         baseline_params: Optional[SplineBaselineParams] = None,
         kernel_params: Optional[ExpKernelParams] = None,
         seed: Optional[int] = 42,
+        ci_integration_method: str = "mc_trapezoidal",
+        ci_num_points: int = 10,
+        terminating: bool = False,
     ):
         """
-        Initialize spline-based baseline exponential kernel Hawkes process.
+        Initialize spline-based baseline exponential kernel Hawkes process with numerical integration.
 
         Args:
             D: Number of event types
-            baseline_knots: Knots for spline baseline (num_knots,). If None, initialized randomly.
-            baseline_coefs: Coefficients for spline baseline (D, num_coefs). If None, initialized randomly.
-            alpha: Branching ratio matrix (D,D). If None, initialized randomly.
-            beta: Decay rate matrix (D,D). If None, initialized randomly.
+            num_knots: Number of knots for spline baseline
+            delta_t: Spacing between knots (float for uniform, tensor for variable)
+            baseline_params: Spline baseline parameters. If None, initialized randomly.
+            kernel_params: Kernel parameters. If None, initialized randomly.
             seed: Random seed
+            ci_integration_method: Method for numerical integration ("trapezoidal" or "mc_trapezoidal")
+            ci_num_points: Number of points for numerical integration
+            terminating: If True, each event type can only occur once
         """
         baseline = SplineBaselineModule(D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed)
         kernel = ExpKernelModule(D, kernel_params, seed)
 
-        super().__init__(baseline, kernel, D, seed)
+        super().__init__(baseline, kernel, D, seed, terminating=terminating)
 
-        self.use_analytical_ci = False  # Use numerical CI from base class
-        self.ci_num_points = 10
-        self.ci_integration_method = "mc_trapezoidal"
+        # Configure numerical integration
+        self.use_analytical_ci = False
+        self.ci_integration_method = ci_integration_method
+        self.ci_num_points = ci_num_points
 
 
 class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
@@ -1251,6 +1434,9 @@ class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
     The kernel alpha values are unconstrained, allowing:
     - Positive alpha: excitation (past events increase future intensity)
     - Negative alpha: inhibition (past events decrease future intensity)
+
+    This class uses numerical integration for cumulative intensity since the softplus
+    transformation makes analytical solutions intractable.
     """
 
     def __init__(
@@ -1259,10 +1445,30 @@ class SoftplusConstExpIHawkesProcess(InhibitiveHawkesProcess):
         baseline_params: Optional[UnconstrainedConstantBaselineParams] = None,
         kernel_params: Optional[UnconstrainedExpKernelParams] = None,
         seed: Optional[int] = 42,
+        ci_integration_method: str = "mc_trapezoidal",
+        ci_num_points: int = 10,
+        terminating: bool = False,
     ):
+        """
+        Initialize constant baseline inhibitive Hawkes process with numerical integration.
+
+        Args:
+            D: Number of event types
+            baseline_params: Constant baseline parameters. If None, initialized randomly.
+            kernel_params: Kernel parameters. If None, initialized randomly.
+            seed: Random seed
+            ci_integration_method: Method for numerical integration ("trapezoidal" or "mc_trapezoidal")
+            ci_num_points: Number of points for numerical integration
+            terminating: If True, each event type can only occur once
+        """
         baseline = UnconstrainedConstantBaselineModule(D, baseline_params)
         kernel = UnconstrainedExpKernelModule(D, kernel_params, seed)
-        super().__init__(F.softplus, baseline, kernel, D, seed)
+        super().__init__(F.softplus, baseline, kernel, D, seed, terminating=terminating)
+
+        # Configure numerical integration (required for softplus)
+        self.use_analytical_ci = False
+        self.ci_integration_method = ci_integration_method
+        self.ci_num_points = ci_num_points
 
 
 class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
@@ -1278,6 +1484,9 @@ class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
     The kernel alpha values are unconstrained, allowing:
     - Positive alpha: excitation (past events increase future intensity)
     - Negative alpha: inhibition (past events decrease future intensity)
+
+    This class uses numerical integration for cumulative intensity since the softplus
+    transformation makes analytical solutions intractable.
     """
 
     def __init__(
@@ -1288,9 +1497,12 @@ class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
         baseline_params: Optional[UnconstrainedSplineBaselineParams] = None,
         kernel_params: Optional[UnconstrainedExpKernelParams] = None,
         seed: Optional[int] = 42,
+        ci_integration_method: str = "mc_trapezoidal",
+        ci_num_points: int = 10,
+        terminating: bool = False,
     ):
         """
-        Initialize spline-based baseline inhibitive Hawkes process.
+        Initialize spline-based baseline inhibitive Hawkes process with numerical integration.
 
         Args:
             D: Number of event types
@@ -1299,12 +1511,20 @@ class SoftplusSplineExpIHawkesProcess(InhibitiveHawkesProcess):
             baseline_params: Spline baseline parameters. If None, initialized randomly.
             kernel_params: Kernel parameters. If None, initialized randomly.
             seed: Random seed
+            ci_integration_method: Method for numerical integration ("trapezoidal" or "mc_trapezoidal")
+            ci_num_points: Number of points for numerical integration
+            terminating: If True, each event type can only occur once
         """
         baseline = UnconstrainedSplineBaselineModule(
             D, num_knots=num_knots, delta_t=delta_t, params=baseline_params, seed=seed
         )
         kernel = UnconstrainedExpKernelModule(D, kernel_params, seed)
-        super().__init__(F.softplus, baseline, kernel, D, seed)
+        super().__init__(F.softplus, baseline, kernel, D, seed, terminating=terminating)
+
+        # Configure numerical integration (required for softplus)
+        self.use_analytical_ci = False
+        self.ci_integration_method = ci_integration_method
+        self.ci_num_points = ci_num_points
 
 
 # %%

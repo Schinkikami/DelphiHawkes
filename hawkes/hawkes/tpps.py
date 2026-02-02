@@ -33,7 +33,7 @@ class TemporalPointProcess(nn.Module, ABC):
     of type d at time t.
 
     Core Methods (Required):
-    - intensity(t, ts) OR log_intensity(t, ts): The intensity or log-intensity function
+    - _raw_intensity(t, ts): The raw intensity function (before termination masking)
     - transform_params(): Return parameters in their constrained form
 
     Likelihood Methods (Must implement one of):
@@ -47,8 +47,8 @@ class TemporalPointProcess(nn.Module, ABC):
     - OR use root-finding solver (automatic fallback)
 
     Default Behavior:
-    - If log_intensity is provided but not intensity, intensity is computed via exp(log_intensity)
-    - If neither intensity nor cumulative_intensity are analytical, numerical integration is used
+    - intensity(t, ts) automatically applies termination masking to _raw_intensity(t, ts)
+    - If cumulative_intensity is not analytical, numerical integration is used
     - If CDF inversion is not provided, root-finding solver is used (Brent's method)
     - PDF and CDF use intensity and cumulative_intensity
     """
@@ -60,6 +60,7 @@ class TemporalPointProcess(nn.Module, ABC):
         use_analytical_ci: bool = True,
         ci_integration_method: str = "trapezoidal",
         ci_num_points: int = 100,
+        terminating: bool = False,
     ):
         """
         Initialize the temporal point process.
@@ -72,6 +73,8 @@ class TemporalPointProcess(nn.Module, ABC):
                 (useful for testing/debugging).
             ci_integration_method: Method for numerical integration ("trapezoidal" or "mc_trapezoidal")
             ci_num_points: Number of points for numerical integration
+            terminating: If True, each event type can only occur once (first occurrence data).
+                After an event type occurs, its intensity becomes zero and it cannot occur again.
         """
         super().__init__()
         self.D = D
@@ -79,6 +82,7 @@ class TemporalPointProcess(nn.Module, ABC):
         self.use_analytical_ci = use_analytical_ci
         self.ci_integration_method = ci_integration_method
         self.ci_num_points = ci_num_points
+        self.terminating = terminating
 
         if seed is not None:
             self.generator = torch.Generator().manual_seed(seed)
@@ -88,6 +92,125 @@ class TemporalPointProcess(nn.Module, ABC):
     # =========================================================================
     # Utility functions
     # ========================================================================
+
+    def _get_termination_mask(self, ts: BatchedMVEventData, t: Optional[torch.Tensor] = None, full: bool = False):
+        """
+        Compute a mask indicating which event types have already occurred (terminated).
+
+        For terminating processes, once an event type occurs, it should no longer
+        contribute to the intensity.
+
+        Args:
+            ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
+            t: Optional time points to check termination at. Shape: (batch_size,)
+               If provided, only considers events that occurred strictly before time t.
+               If None, considers all events in the history.
+            full: If True, returns the full termination mask for all time points in ts.
+                    Cannot be true if t is provided.
+
+        Returns:
+            Boolean mask where True indicates the event type has NOT occurred yet.
+            Shape: (batch_size, D)
+            For non-terminating processes, returns all True (no types are masked).
+        """
+
+        if full and t is not None:
+            raise ValueError("Cannot use full=True and provide t simultaneously.")
+
+        if not self.terminating:
+            # Non-terminating: all event types are always active
+            B = ts.time_points.shape[0]
+            device = ts.time_points.device
+            return torch.ones(B, self.D, dtype=torch.bool, device=device)
+
+        # For terminating processes, check which event types have occurred
+        B = ts.time_points.shape[0]
+        L = ts.time_points.shape[1]
+        device = ts.time_points.device
+        dtype = ts.time_points.dtype
+
+        # Valid events (not padding)
+        valid_events = ts.event_types != -1  # (B, L)
+
+        # If t is provided, only consider events strictly before t
+        if t is not None:
+            # Events before time t
+            before_t = ts.time_points < t.unsqueeze(1)  # (B, L)
+            valid_events = valid_events & before_t
+
+        # Vectorized: Create one-hot encoding for each event type
+        # For each (batch, event) pair, create a D-dimensional indicator
+        # event_types: (B, L), values in [0, D-1] or -1 for padding
+        # Clamp to [0, D-1] for scatter, will be masked out by valid_events anyway
+        event_types_clamped = ts.event_types.clamp(min=0, max=self.D - 1)  # (B, L)
+
+        # Create one-hot encoding: (B, L, D)
+        one_hot = torch.nn.functional.one_hot(event_types_clamped, num_classes=self.D).bool()  # (B, L, D)
+
+        # Mask out invalid events
+        one_hot = one_hot & valid_events.unsqueeze(2)  # (B, L, D)
+
+        # Check if any event of each type has occurred: (B, D)
+        type_occurred = one_hot.any(dim=1)  # (B, D)
+
+        # Return mask where True = type has NOT occurred
+        mask = ~type_occurred  # (B, D)
+
+        return mask
+
+    def _get_termination_times(self, ts: BatchedMVEventData) -> torch.Tensor:
+        """
+        Get the termination time for each event type (time when it first occurred).
+
+        For terminating processes, this returns the time at which each event type
+        first occurred. For types that haven't occurred, returns inf.
+
+        Args:
+            ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
+
+        Returns:
+            Termination times for each type. Shape: (batch_size, D)
+            Contains inf for types that haven't occurred yet.
+            For non-terminating processes, returns all inf.
+        """
+        B = ts.time_points.shape[0]
+        L = ts.time_points.shape[1]
+        device = ts.time_points.device
+        dtype = ts.time_points.dtype
+
+        if not self.terminating:
+            # Non-terminating: no types ever terminate
+            return torch.full((B, self.D), float("inf"), dtype=dtype, device=device)
+
+        # Handle empty sequences (no events)
+        if L == 0:
+            return torch.full((B, self.D), float("inf"), dtype=dtype, device=device)
+
+        # Valid events (not padding)
+        valid_events = ts.event_types != -1  # (B, L)
+
+        # Clamp event types to valid range for scatter
+        event_types_clamped = ts.event_types.clamp(min=0, max=self.D - 1)  # (B, L)
+
+        # Create one-hot encoding: (B, L, D)
+        one_hot = torch.nn.functional.one_hot(event_types_clamped, num_classes=self.D).float()  # (B, L, D)
+
+        # Mask out invalid events by setting their one-hot to 0
+        one_hot = one_hot * valid_events.unsqueeze(2).float()  # (B, L, D)
+
+        # Expand time_points to match one_hot shape: (B, L, D)
+        time_expanded = ts.time_points.unsqueeze(2).expand(B, L, self.D)  # (B, L, D)
+
+        # Set times for non-occurrences to inf
+        time_expanded = torch.where(
+            one_hot.bool(), time_expanded, torch.tensor(float("inf"), dtype=dtype, device=device)
+        )
+
+        # Find minimum time for each type (first occurrence): (B, D)
+        termination_times, _ = time_expanded.min(dim=1)  # (B, D)
+
+        return termination_times
+
     @abstractmethod
     def transform_params(self) -> Tuple[torch.Tensor, ...]:
         """
@@ -104,8 +227,25 @@ class TemporalPointProcess(nn.Module, ABC):
         raise NotImplementedError("Subclasses must implement parameter transformation")
 
     # =========================================================================
-    # Intensity Functions (At least one must be implemented)
+    # Intensity Functions (Must be implemented by subclasses)
     # =========================================================================
+
+    @abstractmethod
+    def _raw_intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
+        """
+        Compute the raw (unmasked) intensity function λ_d(t) for each event type d.
+
+        This is the intensity before applying termination masking. Subclasses must
+        override this method to define their intensity function.
+
+        Args:
+            t: Time points where to evaluate intensity. Shape: (batch_size,)
+            ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
+
+        Returns:
+            Raw intensity values for each type and batch. Shape: (batch_size, D)
+        """
+        raise NotImplementedError("Subclasses must implement _raw_intensity")
 
     def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
         """
@@ -114,8 +254,11 @@ class TemporalPointProcess(nn.Module, ABC):
         The intensity function represents the instantaneous rate of events of each
         type conditional on the history of events up to time t.
 
-        Default behavior: Computes exp(log_intensity(t, ts)) if log_intensity is overridden.
-        Override this method if direct computation is more stable/efficient.
+        For terminating processes, the intensity is zero for event types that have
+        already occurred (strictly before time t).
+
+        Subclasses should override _raw_intensity() instead of this method to ensure
+        termination is properly handled.
 
         Args:
             t: Time points where to evaluate intensity. Shape: (batch_size,)
@@ -123,44 +266,74 @@ class TemporalPointProcess(nn.Module, ABC):
 
         Returns:
             Intensity values for each type and batch. Shape: (batch_size, D)
+            For terminating processes, intensities are zero for already-occurred types.
 
         Mathematical definition:
             λ_d(t) = lim_{dt→0} P(event of type d in [t, t+dt] | H_t) / dt
             where H_t is the history of events up to time t.
+            For terminating processes: λ_d(t) = 0 if d has occurred at time t' < t.
         """
-        return torch.exp(self.log_intensity(t, ts))
+        intensities = self._raw_intensity(t, ts)
 
-    def log_intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
-        """
-        Compute the log intensity function log(λ_d(t)) for numerical stability.
+        if self.terminating:
+            # Zero out intensities for event types that have already occurred before time t
+            mask = self._get_termination_mask(ts, t=t)  # (B, D)
+            intensities = intensities * mask.float()
 
-        Computing in log-space can be more numerically stable, especially when
-        intensities are very small or very large.
-
-        Default behavior: Computes log(intensity(t, ts)).
-        Override this method if log-computation is more stable/efficient than computing
-        intensity and then taking log.
-
-        Args:
-            t: Time points where to evaluate intensity. Shape: (batch_size,)
-            ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
-
-        Returns:
-            Log-intensity values for each type and batch. Shape: (batch_size, D)
-        """
-        return torch.log(self.intensity(t, ts))
+        return intensities
 
     # =========================================================================
     # Cumulative Intensity Functions. If analytical solution is not provided, numerical integration will be used
     # =========================================================================
 
-    def analytical_cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+    def _raw_analytical_cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, termination_times: Optional[torch.Tensor] = None
+    ):
         """
-        Computes the cumulative intensity function (see cumuluative_intensity) in a analytical form.
+        Computes the cumulative intensity function Λ_d(T) from time 0 to T.
+
+        For terminating processes, subclasses should handle the termination_times parameter
+        to compute: Λ_d(T) = ∫_0^{min(t_d, T)} λ_d(t) dt
+        where t_d is the time when type d first occurred.
+
+        Args:
+            T: End times where to evaluate cumulative intensity. Shape: (batch_size,)
+            ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
+            termination_times: Optional termination time for each type. Shape: (batch_size, D)
+                If provided, CI should be computed up to min(T, termination_times) for each dimension.
+                For non-terminating processes, this will be None.
+
+        Returns:
+            Cumulative intensity for each type. Shape: (batch_size, D)
+
+        Notes:
+            Subclasses should implement efficient termination handling internally.
+            For example, Poisson: μ * min(T, t_term)
+            This avoids the need for dimension-wise iteration in the base class.
         """
         raise NotImplementedError("You can provide an analytical solution to your CI here.")
 
-    def numerical_cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+    def analytical_cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData):
+        """
+        Computes the cumulative intensity function with termination handling.
+
+        For terminating processes, the integral for each type d is:
+            Λ_d(T) = ∫_0^{min(t_d, T)} λ_d(t) dt
+        where t_d is the time when type d first occurred.
+
+        This method passes termination information to _raw_analytical_cumulative_intensity
+        which should handle it efficiently within the model-specific computation.
+        """
+        if not self.terminating:
+            return self._raw_analytical_cumulative_intensity(T, ts, termination_times=None)
+
+        # For terminating processes, compute termination times and pass to implementation.
+        termination_times = self._get_termination_times(ts)  # (B, D)
+        return self._raw_analytical_cumulative_intensity(T, ts, termination_times=termination_times)
+
+    def numerical_cumulative_intensity(
+        self, T: torch.Tensor, ts: BatchedMVEventData, T_low: Optional[torch.Tensor] = None
+    ):
         """
         Compute the cumulative intensity function Λ_d(T) using numerical integration.
 
@@ -168,14 +341,20 @@ class TemporalPointProcess(nn.Module, ABC):
         from time 0 to T, measuring the expected number of events of each type
         up to time T.
 
+        If T_low is provided, computes the integral from T_low to T instead.
+
+        For terminating processes, this automatically handles termination because
+        intensity() returns 0 after termination.
+
         Args:
             T: End times where to evaluate cumulative intensity. Shape: (batch_size,)
             ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
+            T_low: Optional start times for integration. Shape: (batch_size,)
         """
 
         return numerical_integration(
             self.intensity,
-            t_start=torch.zeros_like(T),
+            t_start=torch.zeros_like(T) if T_low is None else T_low,
             t_end=T,
             ts=ts,
             method=self.ci_integration_method,
@@ -183,7 +362,12 @@ class TemporalPointProcess(nn.Module, ABC):
             rng=None,
         )
 
-    def cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData, use_analytical_ci: Optional[bool] = None):
+    def cumulative_intensity(
+        self,
+        T: torch.Tensor,
+        ts: BatchedMVEventData,
+        T_low: Optional[torch.Tensor] = None,
+    ):
         """
         Compute the cumulative intensity function Λ_d(T).
 
@@ -191,22 +375,36 @@ class TemporalPointProcess(nn.Module, ABC):
         from time 0 to T, measuring the expected number of events of each type
         up to time T.
 
-        Default behavior: Uses numerical integration if analytical is not overridden
-        or if use_analytical_ci is False.
+        If T_low is provided, computes the integral from T_low to T instead.
+
+        For terminating processes the logic is handeled in the analytical/numerical implementations.
+        For the numerical case, this is automatic since intensity() returns 0 after termination.
 
         Args:
             T: End times where to evaluate cumulative intensity. Shape: (batch_size,)
             ts: Historical events (batched, padded sequences). Shape: (batch_size, seq_len)
+            T_low: Optional start times for integration. Shape: (batch_size,)
         """
 
-        if use_analytical_ci is None:
-            use_analytical_ci = self.use_analytical_ci
+        # Check legality of T:
+        assert (T >= 0.0).all(), "Cumulative intensity is only defined for T >= 0."
+        assert T.shape[0] == ts.time_points.shape[0], "T must have the same batch size as ts"
+
+        if T_low is not None:
+            assert (T_low >= 0.0).all(), "Cumulative intensity is only defined for T_low >= 0."
+            assert T_low.shape[0] == ts.time_points.shape[0], "T_low must have the same batch size as ts"
+            assert (T >= T_low).all(), "Cumulative intensity requires T >= T_low."
 
         # Use the analytical solution. Throws an not-implemented error if not provided.
-        if use_analytical_ci:
-            return self.analytical_cumulative_intensity(T, ts)
+        if self.use_analytical_ci:
+            ci = self.analytical_cumulative_intensity(T, ts)  # (B,D)
+            if T_low is not None:
+                ci_low = self.analytical_cumulative_intensity(T_low, ts)  # (B,D)
+                ci = ci - ci_low
+            return ci  # (B,D)
+
         else:
-            return self.numerical_cumulative_intensity(T, ts)
+            return self.numerical_cumulative_intensity(T, ts, T_low=T_low)  # (B,D)
 
     # ========================================================================
     # CDF/CI Inversion (Override for analytical solution)
@@ -233,6 +431,7 @@ class TemporalPointProcess(nn.Module, ABC):
 
         Useful for sampling and other applications requiring CI inversion.
         """
+        # TODO is there a way to cache and reuse the inbetween intensities if we have numerical integration??
 
         assert u.shape[0] == ts.time_points.shape[0], "u must have the same batch size as ts"
 
@@ -449,7 +648,7 @@ class TemporalPointProcess(nn.Module, ABC):
         assert (T >= ts.max_time).all(), "PDF is only defined for T >= last event time."
 
         intensities = self.intensity(T, ts)  # Shape: (B, D)
-        ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B, D)
+        ci = self.cumulative_intensity(T, ts, T_low=ts.max_time)  # Shape: (B, D)
         pdfs = intensities * torch.exp(-torch.sum(ci, dim=1, keepdim=True))  # Shape: (B, D)
         return pdfs
 
@@ -484,7 +683,7 @@ class TemporalPointProcess(nn.Module, ABC):
 
         assert (T >= ts.max_time).all(), "CDF is only defined for T >= last event time."
 
-        ci = self.cumulative_intensity(T, ts) - self.cumulative_intensity(ts.max_time, ts)  # Shape: (B, D)
+        ci = self.cumulative_intensity(T, ts, T_low=ts.max_time)  # Shape: (B, D)
         cdfs = 1 - torch.exp(-torch.sum(ci, dim=1))  # Shape: (B,)
         return cdfs
 
@@ -525,6 +724,8 @@ class TemporalPointProcess(nn.Module, ABC):
 
             where S(s) = exp(-∑_d (Λ_d(s) - Λ_d(t_N))) is the survival function.
         """
+        # TODO optimize computation for numerical integration. Currently the CI is computed so often, which is extremly inefficient if we use
+        # numerical CI. Would be much better to cache the intensities we use for CI_inversion and later for the integration of probs.
         device = ts.time_points.device
         t_last = ts.max_time  # Shape: (B,)
 
@@ -560,10 +761,13 @@ class TemporalPointProcess(nn.Module, ABC):
             lam_k = self.intensity(t_k, ts)  # (B, D)
 
             # Cumulative intensity at t_k
-            ci_k = self.cumulative_intensity(t_k, ts)  # (B, D)
+            if self.use_analytical_ci:
+                ci_k = self.cumulative_intensity(t_k, ts)  # (B, D)
+                delta_ci = ci_k - ci_base  # (B, D)
+            else:
+                delta_ci = self.cumulative_intensity(t_k, ts, T_low=t_last)  # (B, D)
 
             # Survival function: exp(-sum_d (Λ_d(t_k) - Λ_d(t_last)))
-            delta_ci = ci_k - ci_base  # (B, D)
             survival = torch.exp(-delta_ci.sum(dim=1, keepdim=True))  # (B, 1)
 
             # Integrand: λ_m(t_k) * S(t_k)
@@ -599,9 +803,11 @@ class TemporalPointProcess(nn.Module, ABC):
         Default implementation: Uses inverse CDF method.
         Override for model-specific sampling strategies (thinning, etc.).
 
+        For terminating processes, sampling stops when all event types have occurred.
+
         Args:
             ts: Initial event history (single sequence, not batched)
-            num_steps: Number of events to generate
+            num_steps: Number of events to generate (for terminating: min(num_steps, remaining types))
             rng: Random number generator or seed for reproducibility
 
         Returns:
@@ -617,6 +823,9 @@ class TemporalPointProcess(nn.Module, ABC):
             - Spline: Inverse CDF via numerical inversion
 
             Not all models may have efficient sampling implementations.
+
+            For terminating processes, sampling automatically stops when all event
+            types have occurred, even if num_steps is larger.
         """
         if rng is None:
             rng = torch.Generator()
@@ -629,7 +838,15 @@ class TemporalPointProcess(nn.Module, ABC):
         time_samples = []
         dist_samples = []
 
-        for _ in range(num_steps):
+        for step in range(num_steps):
+            # For terminating processes, check if all types have occurred
+            if self.terminating:
+                mask = self._get_termination_mask(batched)  # (1, D)
+                remaining_types = mask[0].sum().item()
+                if remaining_types == 0:
+                    # All types have occurred, stop sampling
+                    break
+
             # Sample the target quantile of the (class marginalized) CDF from uniform.
             u = torch.rand(size=(), generator=rng, device=device)
 
@@ -640,13 +857,31 @@ class TemporalPointProcess(nn.Module, ABC):
             # Invert CDF to get new event time. The offset with t_last is handled in the inversion implementation.
             t_star = self.inverse_CDF(u.unsqueeze(0), batched)  # (1,)
 
+            # Ensure the sampled time is after the last event (important for terminating processes
+            # where inverse_CDF may not properly account for reduced marginal intensity)
+            t_last = batched.max_time if hasattr(batched, "max_time") else batched.time_points.max()
+            if t_star.item() < t_last.item():
+                t_star = t_last + torch.rand(size=(), generator=rng, device=device) * 0.1
+
             # Sample event type from intensity-weighted categorical
             lam_vec = self.intensity(t_star, batched)[0]  # Shape: (D,)
             lam_sum = float(lam_vec.sum().item())
 
             if lam_sum <= 1e-12 or not (lam_sum == lam_sum):
-                # Degenerate: choose uniformly
-                type_idx = torch.randint(high=self.D, size=(1,), generator=rng)
+                # Degenerate case
+                if self.terminating:
+                    # For terminating: choose uniformly from remaining types
+                    mask = self._get_termination_mask(batched)[0]  # (D,) - squeeze batch dim
+                    remaining_indices = torch.where(mask)[0]
+                    if len(remaining_indices) > 0:
+                        random_idx = torch.randint(high=len(remaining_indices), size=(1,), generator=rng, device=device)
+                        type_idx = remaining_indices[random_idx]
+                    else:
+                        # Should not happen as we check above, but handle gracefully
+                        break
+                else:
+                    # Non-terminating: choose uniformly from all types
+                    type_idx = torch.randint(high=self.D, size=(1,), generator=rng, device=device)
             else:
                 probs = lam_vec / lam_sum
                 type_idx = torch.multinomial(probs, num_samples=1, generator=rng)
@@ -682,6 +917,7 @@ class NumericalTemporalPointProcess(TemporalPointProcess, ABC):
         seed: Optional[int] = 42,
         ci_integration_method: str = "mc_trapezoidal",
         ci_num_points: int = 10,
+        terminating: bool = False,
     ):
         """
         Initialize a numerical temporal point process.
@@ -693,6 +929,7 @@ class NumericalTemporalPointProcess(TemporalPointProcess, ABC):
                 Default is "mc_trapezoidal" which uses Monte Carlo sampling with trapezoidal rule
             ci_num_points: Number of points for numerical integration
                 Default is 10, which is relatively coarse but fast
+            terminating: If True, each event type can only occur once (first occurrence data)
         """
         super().__init__(
             D=D,
@@ -700,6 +937,7 @@ class NumericalTemporalPointProcess(TemporalPointProcess, ABC):
             use_analytical_ci=False,  # Always use numerical integration
             ci_integration_method=ci_integration_method,
             ci_num_points=ci_num_points,
+            terminating=terminating,
         )
 
     def likelihood(
@@ -858,57 +1096,3 @@ class NumericalTemporalPointProcess(TemporalPointProcess, ABC):
             return positive_likelihood + negative_likelihood
         else:
             return positive_likelihood * negative_likelihood
-
-
-class DebugNumericalPoisson(NumericalTemporalPointProcess):
-    """
-    A simple constant-rate Poisson process for debugging NumericalTemporalPointProcess.
-
-    This is a homogeneous Poisson process with constant intensity μ for each dimension.
-    The intensity does NOT depend on history, making it easy to verify correctness.
-
-    Analytical solutions (for comparison):
-        - Intensity: λ_d(t) = μ_d (constant)
-        - Cumulative intensity: Λ_d(T) = μ_d * T
-        - Likelihood: log L = sum_i log(μ_{m_i}) - sum_d μ_d * T
-    """
-
-    def __init__(
-        self,
-        D: int,
-        mu: Optional[torch.Tensor] = None,
-        seed: Optional[int] = 42,
-        ci_integration_method: str = "trapezoidal",
-        ci_num_points: int = 50,
-    ):
-        """
-        Args:
-            D: Number of event types
-            mu: Base intensity rates. Shape: (D,). If None, defaults to ones.
-            seed: Random seed
-            ci_integration_method: Integration method for numerical CI
-            ci_num_points: Number of integration points
-        """
-        super().__init__(
-            D=D,
-            seed=seed,
-            ci_integration_method=ci_integration_method,
-            ci_num_points=ci_num_points,
-        )
-
-        if mu is None:
-            mu = torch.ones(D, dtype=torch.float64)
-        self.register_buffer("mu", mu)
-
-    def transform_params(self) -> Tuple[torch.Tensor, ...]:
-        """Return the intensity rates."""
-        return (self.mu,)
-
-    def intensity(self, t: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
-        """Constant intensity μ for all times."""
-        B = t.shape[0]
-        return self.mu.unsqueeze(0).expand(B, -1)  # (B, D)
-
-    def analytical_cumulative_intensity(self, T: torch.Tensor, ts: BatchedMVEventData) -> torch.Tensor:
-        """Analytical CI for verification: Λ_d(T) = μ_d * T"""
-        return self.mu.unsqueeze(0) * T.unsqueeze(1)  # (B, D)
